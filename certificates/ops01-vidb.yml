@@ -1,0 +1,43 @@
+---
+certificate:
+  name: ops01-vidb
+  enabled: true
+
+  common_name: vidb.vcf.sdn-warrior.cloud
+
+  subject:
+    country: DE
+    state: RLP
+    locality: NW
+    organization: SDN-Warrior
+    organizational_unit: SDN-Warrior
+
+  sans:
+    - vidb.vcf.sdn-warrior.cloud
+
+  ip_sans: []
+
+  key:
+    type: rsa
+    size: 4096
+
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    issuance_timeout: 300
+
+  challenge:
+    type: dns-01
+    provider: cloudflare
+    credentials_file: /etc/letsencrypt/cloudflare/sdn-warrior-cloud.ini
+    propagation_seconds: 30
+
+  deployment:
+    type: vcf_operations
+    ops_endpoint: ops01.vcf.sdn-warrior.cloud
+    appliance: IDENTITY_BROKER
+    target: vidb.vcf.sdn-warrior.cloud
+    validate_certs: false
+    root_ca_file: /etc/ssl/certs/ISRG_Root_X1.pem
+
+  renewal:
+    renew_before_days: 30

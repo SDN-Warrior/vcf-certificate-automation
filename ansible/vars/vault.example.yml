@@ -1,0 +1,40 @@
+---
+# =============================================================================
+# VCF Certificate Automation
+# Example Ansible Vault variables
+#
+# Copy:
+#
+#   cp ansible/vars/vault.example.yml ansible/vars/vault.yml
+#
+# Edit the values and encrypt the file:
+#
+#   ansible-vault encrypt ansible/vars/vault.yml
+#
+# The real vault.yml must never be committed.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# VCF Operations
+# -----------------------------------------------------------------------------
+
+vcf_ops_user: "admin"
+vcf_ops_password: "CHANGE_ME"
+
+# Optional authentication source.
+# Uncomment when authentication through an external source is required.
+#
+# vcf_ops_auth_source: "YOUR_AUTH_SOURCE"
+
+
+# -----------------------------------------------------------------------------
+# Microsoft Windows DNS
+#
+# Required only for certificate definitions using:
+#
+#   challenge:
+#     provider: windows_dns
+# -----------------------------------------------------------------------------
+
+windows_dns_user: "DOMAIN\\service-account"
+windows_dns_password: "CHANGE_ME"

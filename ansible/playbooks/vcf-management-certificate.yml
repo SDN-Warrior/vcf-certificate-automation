@@ -1,0 +1,496 @@
+---
+# =============================================================================
+# Step 1 - Generate CSR through VCF Operations
+# =============================================================================
+
+- import_playbook: vcf-management-generate-csr.yml
+
+
+# =============================================================================
+# Step 2 - Request certificate through ACME
+# =============================================================================
+
+- name: Request certificate through ACME
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    certificate_file: >-
+      {{ playbook_dir }}/../../certificates/{{ certificate_name }}.yml
+
+    certificate_base_dir: >-
+      /etc/vcf-certmanager/certificates/{{ certificate_name }}
+
+    csr_path: "{{ certificate_base_dir }}/request.csr"
+    cert_path: "{{ certificate_base_dir }}/cert.pem"
+    chain_path: "{{ certificate_base_dir }}/chain.pem"
+    fullchain_path: "{{ certificate_base_dir }}/fullchain.pem"
+
+    dns_auth_hook: >-
+      {{ playbook_dir }}/../../hooks/dns-auth.sh {{ certificate_name }}
+
+    dns_cleanup_hook: >-
+      {{ playbook_dir }}/../../hooks/dns-cleanup.sh {{ certificate_name }}
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Load certificate configuration
+    # -------------------------------------------------------------------------
+
+    - name: Load certificate definition
+      ansible.builtin.include_vars:
+        file: "{{ certificate_file }}"
+
+    # -------------------------------------------------------------------------
+    # Validate common ACME configuration
+    # -------------------------------------------------------------------------
+
+    - name: Validate ACME configuration
+      ansible.builtin.assert:
+        that:
+          - certificate.enabled | default(true) | bool
+          - certificate.acme is defined
+          - certificate.acme.server is defined
+          - certificate.challenge is defined
+          - certificate.challenge.type is defined
+          - certificate.challenge.type == 'dns-01'
+          - certificate.challenge.provider is defined
+          - certificate.challenge.provider in ['windows_dns', 'cloudflare']
+          - certificate.common_name is defined
+          - certificate.sans is defined
+          - certificate.sans | length > 0
+        fail_msg: >-
+          ACME configuration for {{ certificate_name }} is incomplete
+          or uses an unsupported challenge provider.
+
+    # -------------------------------------------------------------------------
+    # Validate Windows DNS / internal ACME configuration
+    # -------------------------------------------------------------------------
+
+    - name: Validate Windows DNS ACME configuration
+      ansible.builtin.assert:
+        that:
+          - certificate.acme.profile is defined
+          - certificate.challenge.dns_server is defined
+          - certificate.challenge.dns_zone is defined
+          - certificate.challenge.ttl is defined
+          - certificate.challenge.validation_resolvers is defined
+          - certificate.challenge.validation_resolvers | length > 0
+        fail_msg: >-
+          Windows DNS ACME configuration for {{ certificate_name }}
+          is incomplete.
+      when:
+        - certificate.challenge.provider == 'windows_dns'
+
+    # -------------------------------------------------------------------------
+    # Validate Cloudflare configuration
+    # -------------------------------------------------------------------------
+
+    - name: Validate Cloudflare ACME configuration
+      ansible.builtin.assert:
+        that:
+          - certificate.challenge.credentials_file is defined
+          - certificate.challenge.credentials_file | length > 0
+          - certificate.challenge.propagation_seconds is defined
+          - certificate.challenge.propagation_seconds | int > 0
+        fail_msg: >-
+          Cloudflare ACME configuration for {{ certificate_name }}
+          is incomplete.
+      when:
+        - certificate.challenge.provider == 'cloudflare'
+
+    - name: Check Cloudflare credentials file
+      ansible.builtin.stat:
+        path: "{{ certificate.challenge.credentials_file }}"
+      register: cloudflare_credentials
+      when:
+        - certificate.challenge.provider == 'cloudflare'
+
+    - name: Validate Cloudflare credentials file
+      ansible.builtin.assert:
+        that:
+          - cloudflare_credentials.stat.exists
+          - cloudflare_credentials.stat.isreg
+          - cloudflare_credentials.stat.readable
+        fail_msg: >-
+          Cloudflare credentials file
+          {{ certificate.challenge.credentials_file }}
+          does not exist or is not readable.
+      when:
+        - certificate.challenge.provider == 'cloudflare'
+
+    # -------------------------------------------------------------------------
+    # The current VCF certificate pipeline supports DNS identifiers only.
+    # -------------------------------------------------------------------------
+
+    - name: Validate DNS-only ACME identifiers
+      ansible.builtin.assert:
+        that:
+          - certificate.ip_sans | default([]) | length == 0
+        fail_msg: >-
+          The current certificate pipeline supports DNS identifiers only.
+          Remove ip_sans from {{ certificate_name }}.
+
+    # -------------------------------------------------------------------------
+    # Verify CSR exists
+    # -------------------------------------------------------------------------
+
+    - name: Check generated CSR
+      ansible.builtin.stat:
+        path: "{{ csr_path }}"
+      register: csr_file
+
+    - name: Validate generated CSR exists
+      ansible.builtin.assert:
+        that:
+          - csr_file.stat.exists
+          - csr_file.stat.isreg
+        fail_msg: >-
+          Generated CSR {{ csr_path }} does not exist.
+
+    - name: Verify generated CSR with OpenSSL
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -verify
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Remove previous local ACME result
+    #
+    # These are only local working files. The currently installed certificate
+    # is already stored on the VCF component.
+    # -------------------------------------------------------------------------
+
+    - name: Remove previous certificate output
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ cert_path }}"
+        - "{{ chain_path }}"
+        - "{{ fullchain_path }}"
+
+    # =========================================================================
+    # ACME Provider: Windows DNS
+    #
+    # Used with the internal ACME-Server-ADCS implementation.
+    #
+    # Flow:
+    #
+    # Certbot
+    #   -> manual DNS-01 hook
+    #   -> Windows DNS
+    #   -> ACME-Server-ADCS
+    #   -> Microsoft AD CS
+    # =========================================================================
+
+    - name: Request certificate through ACME using Windows DNS
+      ansible.builtin.command:
+        argv:
+          - certbot
+          - certonly
+
+          - --server
+          - "{{ certificate.acme.server }}"
+
+          - --required-profile
+          - "{{ certificate.acme.profile }}"
+
+          - --manual
+          - --preferred-challenges
+          - dns
+
+          - --manual-auth-hook
+          - "{{ dns_auth_hook }}"
+
+          - --manual-cleanup-hook
+          - "{{ dns_cleanup_hook }}"
+
+          - --issuance-timeout
+          - "{{ certificate.acme.issuance_timeout | default(300) | string }}"
+
+          - --csr
+          - "{{ csr_path }}"
+
+          - --cert-path
+          - "{{ cert_path }}"
+
+          - --chain-path
+          - "{{ chain_path }}"
+
+          - --fullchain-path
+          - "{{ fullchain_path }}"
+
+          - --non-interactive
+          - --register-unsafely-without-email
+          - --agree-tos
+      register: certbot_windows_dns_result
+      changed_when: true
+      when:
+        - certificate.challenge.provider == 'windows_dns'
+
+    # =========================================================================
+    # ACME Provider: Cloudflare
+    #
+    # Used for public ACME services such as Let's Encrypt.
+    #
+    # Flow:
+    #
+    # Certbot
+    #   -> dns-cloudflare plugin
+    #   -> Cloudflare DNS API
+    #   -> ACME CA
+    # =========================================================================
+
+    - name: Request certificate through ACME using Cloudflare
+      ansible.builtin.command:
+        argv:
+          - certbot
+          - certonly
+
+          - --server
+          - "{{ certificate.acme.server }}"
+
+          - --dns-cloudflare
+
+          - --dns-cloudflare-credentials
+          - "{{ certificate.challenge.credentials_file }}"
+
+          - --dns-cloudflare-propagation-seconds
+          - "{{ certificate.challenge.propagation_seconds | string }}"
+
+          - --issuance-timeout
+          - "{{ certificate.acme.issuance_timeout | default(300) | string }}"
+
+          - --csr
+          - "{{ csr_path }}"
+
+          - --cert-path
+          - "{{ cert_path }}"
+
+          - --chain-path
+          - "{{ chain_path }}"
+
+          - --fullchain-path
+          - "{{ fullchain_path }}"
+
+          - --non-interactive
+          - --register-unsafely-without-email
+          - --agree-tos
+      register: certbot_cloudflare_result
+      changed_when: true
+      when:
+        - certificate.challenge.provider == 'cloudflare'
+
+    # -------------------------------------------------------------------------
+    # Complete certificate chain for VCF Operations
+    #
+    # ACME providers such as Let's Encrypt intentionally omit the final
+    # self-signed root CA from fullchain.pem.
+    #
+    # VCF Operations requires the complete certificate chain including
+    # the root CA.
+    #
+    # If deployment.root_ca_file is configured, append that root CA to
+    # the freshly generated ACME fullchain.
+    #
+    # fullchain.pem is removed before every new ACME request, therefore
+    # the root CA cannot accumulate across renewal runs.
+    # -------------------------------------------------------------------------
+
+    - name: Check configured VCF root CA is readable
+      ansible.builtin.command:
+        argv:
+          - test
+          - -r
+          - "{{ certificate.deployment.root_ca_file }}"
+      changed_when: false
+      when:
+        - certificate.deployment.root_ca_file is defined
+        - certificate.deployment.root_ca_file | length > 0
+
+    - name: Validate configured VCF root CA certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ certificate.deployment.root_ca_file }}"
+          - -noout
+          - -subject
+          - -issuer
+      changed_when: false
+      when:
+        - certificate.deployment.root_ca_file is defined
+        - certificate.deployment.root_ca_file | length > 0
+
+    - name: Append configured root CA to fullchain for VCF Operations
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        cat           "{{ certificate.deployment.root_ca_file }}"           >> "{{ fullchain_path }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - certificate.deployment.root_ca_file is defined
+        - certificate.deployment.root_ca_file | length > 0
+
+    # -------------------------------------------------------------------------
+    # Verify generated certificate files
+    # -------------------------------------------------------------------------
+
+    - name: Check issued certificate
+      ansible.builtin.stat:
+        path: "{{ cert_path }}"
+      register: cert_file
+
+    - name: Check issued certificate chain
+      ansible.builtin.stat:
+        path: "{{ chain_path }}"
+      register: chain_file
+
+    - name: Check issued fullchain
+      ansible.builtin.stat:
+        path: "{{ fullchain_path }}"
+      register: fullchain_file
+
+    - name: Validate ACME output files
+      ansible.builtin.assert:
+        that:
+          - cert_file.stat.exists
+          - chain_file.stat.exists
+          - fullchain_file.stat.exists
+        fail_msg: >-
+          ACME issuance completed but one or more certificate files
+          are missing.
+
+    # -------------------------------------------------------------------------
+    # Validate issued certificate
+    # -------------------------------------------------------------------------
+
+    - name: Read issued certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ cert_path }}"
+          - -noout
+          - -subject
+          - -issuer
+          - -serial
+          - -dates
+          - -ext
+          - subjectAltName
+      register: issued_certificate
+      changed_when: false
+
+    - name: Validate certificate common name
+      ansible.builtin.assert:
+        that:
+          - certificate.common_name in issued_certificate.stdout
+        fail_msg: >-
+          Issued certificate does not contain expected common name
+          {{ certificate.common_name }}.
+
+    - name: Validate certificate DNS SANs
+      ansible.builtin.assert:
+        that:
+          - item in issued_certificate.stdout
+        fail_msg: >-
+          Issued certificate does not contain expected DNS SAN {{ item }}.
+      loop: "{{ certificate.sans }}"
+
+    # -------------------------------------------------------------------------
+    # Verify CSR and certificate belong to the same VCF-managed private key
+    # -------------------------------------------------------------------------
+
+    - name: Calculate CSR public key SHA256
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        openssl req \
+          -in "{{ csr_path }}" \
+          -noout \
+          -pubkey |
+        openssl pkey \
+          -pubin \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: csr_public_key_hash
+      changed_when: false
+
+    - name: Calculate certificate public key SHA256
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        openssl x509 \
+          -in "{{ cert_path }}" \
+          -noout \
+          -pubkey |
+        openssl pkey \
+          -pubin \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: cert_public_key_hash
+      changed_when: false
+
+    - name: Validate CSR and certificate public keys match
+      ansible.builtin.assert:
+        that:
+          - csr_public_key_hash.stdout | length > 0
+          - cert_public_key_hash.stdout | length > 0
+          - csr_public_key_hash.stdout == cert_public_key_hash.stdout
+        fail_msg: >-
+          Issued certificate does not belong to the private key
+          managed by VCF Operations. Deployment has been stopped.
+
+    # -------------------------------------------------------------------------
+    # Validate certificate chain
+    # -------------------------------------------------------------------------
+
+    - name: Validate certificate chain
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - verify
+          - -CAfile
+          - "{{ chain_path }}"
+          - "{{ cert_path }}"
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------------
+
+    - name: Show ACME result
+      ansible.builtin.debug:
+        msg:
+          - "Certificate    : {{ certificate_name }}"
+          - "Common Name    : {{ certificate.common_name }}"
+          - "ACME Server    : {{ certificate.acme.server }}"
+          - "ACME Provider  : {{ certificate.challenge.provider }}"
+          - "ACME Profile   : {{ certificate.acme.profile | default('none') }}"
+          - "CSR Public Key : {{ csr_public_key_hash.stdout }}"
+          - "Cert Public Key: {{ cert_public_key_hash.stdout }}"
+          - "ACME issuance  : successful"
+
+
+# =============================================================================
+# Step 3 - Replace certificate through VCF Operations
+# =============================================================================
+
+- import_playbook: vcf-management-replace-certificate.yml

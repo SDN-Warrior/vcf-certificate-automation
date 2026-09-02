@@ -1,0 +1,541 @@
+name: Scheduled Certificate Renewal
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+
+  workflow_dispatch:
+    inputs:
+      certificate:
+        description: Certificate to check or renew
+        required: false
+        default: ""
+        type: string
+
+      force_renewal:
+        description: Force certificate renewal
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  renew:
+    runs-on: vcf-certmanager
+
+    env:
+      SELECTED_CERTIFICATE: ${{ inputs.certificate }}
+      FORCE_RENEWAL: ${{ inputs.force_renewal }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Validate Vault access
+      # -----------------------------------------------------------------------
+
+      - name: Check Vault access
+        run: |
+          set -euo pipefail
+
+          ansible-vault view \
+            ansible/vars/vault.yml \
+            --vault-password-file /etc/vcf-certmanager/vault-pass \
+            >/dev/null
+
+          echo "Ansible Vault access: OK"
+
+      # -----------------------------------------------------------------------
+      # Build list of enabled certificate definitions
+      #
+      # Output format:
+      #
+      # certificate_name<TAB>target<TAB>port<TAB>renew_before_days
+      # -----------------------------------------------------------------------
+
+      - name: Load certificate definitions
+        run: |
+          set -euo pipefail
+
+          CERTIFICATE_LIST="${GITHUB_WORKSPACE}/.renewal-certificates"
+
+          rm -f "${CERTIFICATE_LIST}"
+
+          python3 - "${CERTIFICATE_LIST}" <<'PY'
+          import glob
+          import os
+          import sys
+          import yaml
+
+          output_file = sys.argv[1]
+
+          certificates = []
+
+          for filename in sorted(glob.glob("certificates/*.yml")):
+              with open(filename, "r", encoding="utf-8") as handle:
+                  data = yaml.safe_load(handle)
+
+              if not isinstance(data, dict):
+                  raise SystemExit(
+                      f"{filename}: YAML root must be a mapping"
+                  )
+
+              certificate = data.get("certificate")
+
+              if not isinstance(certificate, dict):
+                  raise SystemExit(
+                      f"{filename}: certificate section is missing"
+                  )
+
+              expected_name = os.path.splitext(
+                  os.path.basename(filename)
+              )[0]
+
+              certificate_name = certificate.get("name")
+
+              if certificate_name != expected_name:
+                  raise SystemExit(
+                      f"{filename}: certificate.name "
+                      f"'{certificate_name}' does not match "
+                      f"filename '{expected_name}'"
+                  )
+
+              enabled = certificate.get("enabled", True)
+
+              if not isinstance(enabled, bool):
+                  raise SystemExit(
+                      f"{filename}: certificate.enabled must be "
+                      f"true or false"
+                  )
+
+              if not enabled:
+                  print(
+                      f"Skipping disabled certificate: "
+                      f"{certificate_name}",
+                      file=sys.stderr
+                  )
+                  continue
+
+              renewal = certificate.get("renewal")
+
+              if not isinstance(renewal, dict):
+                  raise SystemExit(
+                      f"{filename}: renewal section is missing"
+                  )
+
+              renew_before_days = renewal.get(
+                  "renew_before_days"
+              )
+
+              if (
+                  not isinstance(renew_before_days, int)
+                  or isinstance(renew_before_days, bool)
+                  or renew_before_days < 1
+              ):
+                  raise SystemExit(
+                      f"{filename}: renewal.renew_before_days "
+                      f"must be a positive integer"
+                  )
+
+              deployment = certificate.get("deployment")
+
+              if not isinstance(deployment, dict):
+                  raise SystemExit(
+                      f"{filename}: deployment section is missing"
+                  )
+
+              deployment_type = deployment.get("type")
+
+              if deployment_type != "vcf_operations":
+                  print(
+                      f"Skipping unsupported deployment type "
+                      f"'{deployment_type}' for "
+                      f"{certificate_name}",
+                      file=sys.stderr
+                  )
+                  continue
+
+              target = deployment.get("target")
+
+              if not isinstance(target, str) or not target:
+                  raise SystemExit(
+                      f"{filename}: deployment.target is missing"
+                  )
+
+              port = deployment.get("port", 443)
+
+              if (
+                  not isinstance(port, int)
+                  or isinstance(port, bool)
+                  or port < 1
+                  or port > 65535
+              ):
+                  raise SystemExit(
+                      f"{filename}: deployment.port must be "
+                      f"a valid TCP port"
+                  )
+
+              certificates.append(
+                  (
+                      certificate_name,
+                      target,
+                      port,
+                      renew_before_days,
+                  )
+              )
+
+          with open(
+              output_file,
+              "w",
+              encoding="utf-8"
+          ) as handle:
+              for (
+                  certificate_name,
+                  target,
+                  port,
+                  renew_before_days,
+              ) in certificates:
+                  handle.write(
+                      f"{certificate_name}\t"
+                      f"{target}\t"
+                      f"{port}\t"
+                      f"{renew_before_days}\n"
+                  )
+          PY
+
+          echo
+          echo "=================================================="
+          echo "Certificates configured for renewal monitoring"
+          echo "=================================================="
+
+          if [ ! -s "${CERTIFICATE_LIST}" ]; then
+            echo "No enabled certificates found."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r \
+            CERTIFICATE_NAME \
+            TARGET \
+            PORT \
+            RENEW_BEFORE_DAYS
+          do
+            echo
+            echo "Certificate : ${CERTIFICATE_NAME}"
+            echo "Endpoint    : ${TARGET}:${PORT}"
+            echo "Renew before: ${RENEW_BEFORE_DAYS} days"
+          done < "${CERTIFICATE_LIST}"
+
+      # -----------------------------------------------------------------------
+      # Check certificate lifetime and renew when required
+      # -----------------------------------------------------------------------
+
+      - name: Check and renew certificates
+        run: |
+          set -euo pipefail
+
+          CERTIFICATE_LIST="${GITHUB_WORKSPACE}/.renewal-certificates"
+
+          SELECTED_CERTIFICATE="${SELECTED_CERTIFICATE:-}"
+          FORCE_RENEWAL="${FORCE_RENEWAL:-false}"
+
+          if [ -z "${FORCE_RENEWAL}" ]; then
+            FORCE_RENEWAL="false"
+          fi
+
+          if [ ! -s "${CERTIFICATE_LIST}" ]; then
+            echo "No certificates to check."
+            exit 0
+          fi
+
+          MATCHED_CERTIFICATE="false"
+
+          while IFS=$'\t' read -r \
+            CERTIFICATE_NAME \
+            TARGET \
+            PORT \
+            RENEW_BEFORE_DAYS
+          do
+
+            # -----------------------------------------------------------------
+            # workflow_dispatch can optionally select one certificate.
+            #
+            # Scheduled runs leave SELECTED_CERTIFICATE empty and therefore
+            # process all enabled certificate definitions.
+            # -----------------------------------------------------------------
+
+            if [ -n "${SELECTED_CERTIFICATE}" ] && \
+               [ "${CERTIFICATE_NAME}" != "${SELECTED_CERTIFICATE}" ]; then
+              continue
+            fi
+
+            MATCHED_CERTIFICATE="true"
+
+            echo
+            echo "=================================================="
+            echo "Certificate renewal check"
+            echo "=================================================="
+            echo "Certificate : ${CERTIFICATE_NAME}"
+            echo "Endpoint    : ${TARGET}:${PORT}"
+            echo "Threshold   : ${RENEW_BEFORE_DAYS} days"
+            echo "Force       : ${FORCE_RENEWAL}"
+
+            RUNTIME_DIR="/etc/vcf-certmanager/certificates/${CERTIFICATE_NAME}"
+
+            mkdir -p "${RUNTIME_DIR}"
+            chmod 2770 "${RUNTIME_DIR}"
+
+            test -d "${RUNTIME_DIR}"
+            test -w "${RUNTIME_DIR}"
+
+            CURRENT_CERT="$(
+              mktemp \
+                "${GITHUB_WORKSPACE}/current-cert.XXXXXX.pem"
+            )"
+
+            # -----------------------------------------------------------------
+            # Read the certificate that is actually presented by the endpoint.
+            # -----------------------------------------------------------------
+
+            if ! timeout 20 \
+              openssl s_client \
+                -connect "${TARGET}:${PORT}" \
+                -servername "${TARGET}" \
+                </dev/null \
+                2>/dev/null |
+              openssl x509 \
+                -outform PEM \
+                > "${CURRENT_CERT}"
+            then
+              echo "ERROR: Could not read certificate from ${TARGET}:${PORT}"
+              rm -f "${CURRENT_CERT}"
+              exit 1
+            fi
+
+            echo
+            echo "Current certificate:"
+
+            openssl x509 \
+              -in "${CURRENT_CERT}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint \
+              -sha256
+
+            CURRENT_FINGERPRINT="$(
+              openssl x509 \
+                -in "${CURRENT_CERT}" \
+                -noout \
+                -fingerprint \
+                -sha256 |
+              cut -d= -f2
+            )"
+
+            CHECK_SECONDS="$(( RENEW_BEFORE_DAYS * 86400 ))"
+
+            echo "Check window : ${CHECK_SECONDS} seconds"
+
+            RENEW_CERTIFICATE="false"
+
+            # -----------------------------------------------------------------
+            # Manual force mode
+            # -----------------------------------------------------------------
+
+            if [ "${FORCE_RENEWAL}" = "true" ]; then
+              echo
+              echo "Renewal required: YES"
+              echo "Reason          : forced manual renewal"
+
+              RENEW_CERTIFICATE="true"
+
+            # -----------------------------------------------------------------
+            # Normal automatic expiration check
+            #
+            # openssl x509 -checkend returns:
+            #
+            # 0 = certificate is valid longer than CHECK_SECONDS
+            # 1 = certificate expires within CHECK_SECONDS
+            # -----------------------------------------------------------------
+
+            elif openssl x509 \
+              -in "${CURRENT_CERT}" \
+              -checkend "${CHECK_SECONDS}" \
+              -noout
+            then
+              echo
+              echo "Renewal required: NO"
+              echo "Certificate is valid for more than"
+              echo "${RENEW_BEFORE_DAYS} days."
+
+              rm -f "${CURRENT_CERT}"
+              continue
+
+            else
+              echo
+              echo "Renewal required: YES"
+              echo "Reason          : certificate expires within"
+              echo "                  ${RENEW_BEFORE_DAYS} days"
+
+              RENEW_CERTIFICATE="true"
+            fi
+
+            # -----------------------------------------------------------------
+            # Start certificate lifecycle pipeline
+            # -----------------------------------------------------------------
+
+            if [ "${RENEW_CERTIFICATE}" = "true" ]; then
+
+              echo
+              echo "=================================================="
+              echo "Starting certificate renewal"
+              echo "=================================================="
+              echo "Certificate: ${CERTIFICATE_NAME}"
+
+              ./scripts/run-certificate-pipeline.sh "${CERTIFICATE_NAME}"
+
+            fi
+
+            # -----------------------------------------------------------------
+            # Read certificate from endpoint after replacement
+            # -----------------------------------------------------------------
+
+            NEW_CERT="$(
+              mktemp \
+                "${GITHUB_WORKSPACE}/new-cert.XXXXXX.pem"
+            )"
+
+            if ! timeout 20 \
+              openssl s_client \
+                -connect "${TARGET}:${PORT}" \
+                -servername "${TARGET}" \
+                </dev/null \
+                2>/dev/null |
+              openssl x509 \
+                -outform PEM \
+                > "${NEW_CERT}"
+            then
+              echo "ERROR: Could not read renewed certificate from endpoint."
+
+              rm -f \
+                "${CURRENT_CERT}" \
+                "${NEW_CERT}"
+
+              exit 1
+            fi
+
+            NEW_FINGERPRINT="$(
+              openssl x509 \
+                -in "${NEW_CERT}" \
+                -noout \
+                -fingerprint \
+                -sha256 |
+              cut -d= -f2
+            )"
+
+            echo
+            echo "=================================================="
+            echo "Renewed certificate"
+            echo "=================================================="
+
+            openssl x509 \
+              -in "${NEW_CERT}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint \
+              -sha256
+
+            # -----------------------------------------------------------------
+            # Verify that endpoint certificate changed
+            # -----------------------------------------------------------------
+
+            if [ "${CURRENT_FINGERPRINT}" = "${NEW_FINGERPRINT}" ]; then
+              echo
+              echo "ERROR: Endpoint certificate fingerprint did not change."
+
+              rm -f \
+                "${CURRENT_CERT}" \
+                "${NEW_CERT}"
+
+              exit 1
+            fi
+
+            # -----------------------------------------------------------------
+            # During normal scheduled renewal the new certificate must be
+            # outside the configured renewal window.
+            #
+            # This check is intentionally skipped for force_renewal because a
+            # freshly issued certificate can be forced long before expiration.
+            # -----------------------------------------------------------------
+
+            if [ "${FORCE_RENEWAL}" != "true" ]; then
+
+              if ! openssl x509 \
+                -in "${NEW_CERT}" \
+                -checkend "${CHECK_SECONDS}" \
+                -noout
+              then
+                echo
+                echo "ERROR: Renewed certificate is still inside"
+                echo "the ${RENEW_BEFORE_DAYS}-day renewal window."
+
+                rm -f \
+                  "${CURRENT_CERT}" \
+                  "${NEW_CERT}"
+
+                exit 1
+              fi
+
+            fi
+
+            echo
+            echo "Renewal validation: successful"
+            echo "Fingerprint changed: yes"
+
+            if [ "${FORCE_RENEWAL}" = "true" ]; then
+              echo "Renewal mode       : forced"
+            else
+              echo "New lifetime       : outside renewal window"
+            fi
+
+            rm -f \
+              "${CURRENT_CERT}" \
+              "${NEW_CERT}"
+
+          done < "${CERTIFICATE_LIST}"
+
+          # -------------------------------------------------------------------
+          # Fail if a manually selected certificate does not exist or is not
+          # enabled.
+          # -------------------------------------------------------------------
+
+          if [ -n "${SELECTED_CERTIFICATE}" ] && \
+             [ "${MATCHED_CERTIFICATE}" != "true" ]; then
+            echo
+            echo "ERROR: Certificate '${SELECTED_CERTIFICATE}'"
+            echo "was not found or is disabled."
+
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+
+      - name: Renewal check completed
+        if: success()
+        run: |
+          echo "=================================================="
+          echo "Certificate renewal check completed successfully"
+          echo "=================================================="

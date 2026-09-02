@@ -1,0 +1,509 @@
+---
+- name: Replace certificate through VCF Operations
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    certificate_file: >-
+      {{ playbook_dir }}/../../certificates/{{ certificate_name }}.yml
+
+    vault_file: "{{ playbook_dir }}/../vars/vault.yml"
+
+    certificate_base_dir: >-
+      /etc/vcf-certmanager/certificates/{{ certificate_name }}
+
+    csr_path: "{{ certificate_base_dir }}/request.csr"
+    cert_path: "{{ certificate_base_dir }}/cert.pem"
+    chain_path: "{{ certificate_base_dir }}/chain.pem"
+    fullchain_path: "{{ certificate_base_dir }}/fullchain.pem"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Load configuration
+    # -------------------------------------------------------------------------
+
+    - name: Load certificate definition
+      ansible.builtin.include_vars:
+        file: "{{ certificate_file }}"
+
+    - name: Load Ansible Vault
+      ansible.builtin.include_vars:
+        file: "{{ vault_file }}"
+      no_log: true
+
+    - name: Validate configuration
+      ansible.builtin.assert:
+        that:
+          - certificate_name is defined
+          - certificate.common_name is defined
+          - certificate.deployment.type == 'vcf_operations'
+          - certificate.deployment.ops_endpoint is defined
+          - certificate.deployment.appliance is defined
+          - certificate.deployment.target is defined
+          - vcf_ops_user is defined
+          - vcf_ops_password is defined
+        fail_msg: >-
+          VCF Operations deployment configuration is incomplete.
+
+    - name: Set VCF Operations facts
+      ansible.builtin.set_fact:
+        ops_endpoint: "{{ certificate.deployment.ops_endpoint }}"
+        appliance_type: "{{ certificate.deployment.appliance }}"
+        appliance_fqdn: "{{ certificate.deployment.target }}"
+        ops_validate_certs: >-
+          {{ certificate.deployment.validate_certs | default(true) | bool }}
+        certificate_category: "TLS_CERT"
+        ca_type: >-
+          {{ certificate.deployment.ca_type | default('EXTERNAL_CA') }}
+        verify_port: >-
+          {{ certificate.deployment.verify_port | default(443) }}
+
+    - name: Set VCF Operations API base URL
+      ansible.builtin.set_fact:
+        ops_api_base: "https://{{ ops_endpoint }}/suite-api/api"
+
+    # -------------------------------------------------------------------------
+    # Validate local files
+    # -------------------------------------------------------------------------
+
+    - name: Check CSR file
+      ansible.builtin.stat:
+        path: "{{ csr_path }}"
+      register: csr_file
+
+    - name: Check certificate file
+      ansible.builtin.stat:
+        path: "{{ cert_path }}"
+      register: cert_file
+
+    - name: Check fullchain file
+      ansible.builtin.stat:
+        path: "{{ fullchain_path }}"
+      register: fullchain_file
+
+    - name: Validate required certificate files exist
+      ansible.builtin.assert:
+        that:
+          - csr_file.stat.exists
+          - cert_file.stat.exists
+          - fullchain_file.stat.exists
+        fail_msg: >-
+          CSR, certificate or fullchain file is missing for
+          {{ certificate_name }}.
+
+    # -------------------------------------------------------------------------
+    # Validate CSR
+    # -------------------------------------------------------------------------
+
+    - name: Verify CSR with OpenSSL
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -verify
+      changed_when: false
+
+    - name: Read CSR subject
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -subject
+      register: csr_subject
+      changed_when: false
+
+    - name: Validate CSR common name
+      ansible.builtin.assert:
+        that:
+          - certificate.common_name in csr_subject.stdout
+        fail_msg: >-
+          CSR does not contain expected common name
+          {{ certificate.common_name }}.
+
+    # -------------------------------------------------------------------------
+    # Validate issued certificate
+    # -------------------------------------------------------------------------
+
+    - name: Read issued certificate information
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ cert_path }}"
+          - -noout
+          - -subject
+          - -issuer
+          - -serial
+          - -dates
+      register: certificate_info
+      changed_when: false
+
+    - name: Validate certificate common name
+      ansible.builtin.assert:
+        that:
+          - certificate.common_name in certificate_info.stdout
+        fail_msg: >-
+          Issued certificate does not contain expected common name
+          {{ certificate.common_name }}.
+
+    # -------------------------------------------------------------------------
+    # Verify CSR and certificate use the same public key
+    # -------------------------------------------------------------------------
+
+    - name: Calculate CSR public key SHA256
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        openssl req \
+          -in "{{ csr_path }}" \
+          -noout \
+          -pubkey |
+        openssl pkey \
+          -pubin \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: csr_public_key_hash
+      changed_when: false
+
+    - name: Calculate certificate public key SHA256
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        openssl x509 \
+          -in "{{ cert_path }}" \
+          -noout \
+          -pubkey |
+        openssl pkey \
+          -pubin \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: cert_public_key_hash
+      changed_when: false
+
+    - name: Validate CSR and certificate public keys match
+      ansible.builtin.assert:
+        that:
+          - csr_public_key_hash.stdout | length > 0
+          - cert_public_key_hash.stdout | length > 0
+          - csr_public_key_hash.stdout == cert_public_key_hash.stdout
+        fail_msg: >-
+          CSR and certificate public keys do not match.
+          The certificate must not be installed.
+
+    - name: Show public key verification
+      ansible.builtin.debug:
+        msg:
+          - "CSR Public Key SHA256  : {{ csr_public_key_hash.stdout }}"
+          - "Cert Public Key SHA256 : {{ cert_public_key_hash.stdout }}"
+          - "Public keys match      : yes"
+
+    # -------------------------------------------------------------------------
+    # Validate certificate chain
+    # -------------------------------------------------------------------------
+
+    - name: Count certificates in fullchain
+      ansible.builtin.shell: |
+        grep -c \
+          '^-----BEGIN CERTIFICATE-----$' \
+          "{{ fullchain_path }}"
+      args:
+        executable: /bin/bash
+      register: fullchain_count
+      changed_when: false
+
+    - name: Validate fullchain contains certificate chain
+      ansible.builtin.assert:
+        that:
+          - fullchain_count.stdout | int >= 2
+        fail_msg: >-
+          fullchain.pem contains only
+          {{ fullchain_count.stdout }} certificate(s).
+          Expected leaf certificate and CA chain.
+
+    - name: Validate certificate chain with OpenSSL
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - verify
+          - -CAfile
+          - "{{ chain_path }}"
+          - "{{ cert_path }}"
+      register: chain_validation
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Calculate local certificate fingerprint
+    # -------------------------------------------------------------------------
+
+    - name: Calculate local certificate SHA256
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        openssl x509 \
+          -in "{{ cert_path }}" \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: local_certificate_hash
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Read fullchain
+    # -------------------------------------------------------------------------
+
+    - name: Read certificate fullchain
+      ansible.builtin.slurp:
+        src: "{{ fullchain_path }}"
+      register: fullchain_file_content
+
+    - name: Store certificate chain
+      ansible.builtin.set_fact:
+        certificate_chain: >-
+          {{ fullchain_file_content.content | b64decode }}
+
+    # -------------------------------------------------------------------------
+    # Authenticate to VCF Operations
+    # -------------------------------------------------------------------------
+
+    - name: Build VCF Operations authentication request
+      ansible.builtin.set_fact:
+        ops_auth_body:
+          username: "{{ vcf_ops_user }}"
+          password: "{{ vcf_ops_password }}"
+      no_log: true
+
+    - name: Add authentication source when configured
+      ansible.builtin.set_fact:
+        ops_auth_body: >-
+          {{
+            ops_auth_body
+            | combine({'authSource': vcf_ops_auth_source})
+          }}
+      when:
+        - vcf_ops_auth_source is defined
+        - vcf_ops_auth_source | length > 0
+      no_log: true
+
+    - name: Acquire VCF Operations token
+      ansible.builtin.uri:
+        url: "{{ ops_api_base }}/auth/token/acquire"
+        method: POST
+        body_format: json
+        body: "{{ ops_auth_body }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: ops_login
+      no_log: true
+
+    - name: Store VCF Operations token
+      ansible.builtin.set_fact:
+        ops_token: "{{ ops_login.json.token }}"
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # Query current TLS certificate resource
+    # -------------------------------------------------------------------------
+
+    - name: Query TLS certificate for component
+      ansible.builtin.uri:
+        url: >-
+          {{ ops_api_base }}/fleet-management/certificate-management/certificates/query
+        method: POST
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          appliance: "{{ appliance_type }}"
+          applianceFqdn: "{{ appliance_fqdn }}"
+          category: "{{ certificate_category }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: certificate_query
+
+    - name: Validate TLS certificate query result
+      ansible.builtin.assert:
+        that:
+          - certificate_query.json.vcfCertificateModels is defined
+          - certificate_query.json.vcfCertificateModels | length == 1
+        fail_msg: >-
+          Expected exactly one TLS certificate for
+          {{ appliance_type }} {{ appliance_fqdn }},
+          but found
+          {{
+            certificate_query.json.vcfCertificateModels
+            | default([])
+            | length
+          }}.
+
+    - name: Store current TLS certificate
+      ansible.builtin.set_fact:
+        selected_certificate: >-
+          {{ certificate_query.json.vcfCertificateModels[0] }}
+
+    - name: Store certificate resource ID
+      ansible.builtin.set_fact:
+        certificate_resource_id: >-
+          {{ selected_certificate.certificateResourceKey }}
+
+    - name: Show certificate replacement target
+      ansible.builtin.debug:
+        msg:
+          - "Component      : {{ appliance_type }}"
+          - "FQDN           : {{ appliance_fqdn }}"
+          - "Certificate ID : {{ certificate_resource_id }}"
+          - "CA Type        : {{ ca_type }}"
+          - "Chain entries  : {{ fullchain_count.stdout }}"
+          - "New Cert SHA256: {{ local_certificate_hash.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # Replace certificate
+    # -------------------------------------------------------------------------
+
+    - name: Replace certificate through VCF Operations
+      ansible.builtin.uri:
+        url: >-
+          {{ ops_api_base }}/fleet-management/certificate-management/certificates/{{ certificate_resource_id }}
+        method: PUT
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          caType: "{{ ca_type }}"
+          certificateChain: "{{ certificate_chain }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code:
+          - 200
+          - 202
+      register: replace_request
+
+    - name: Validate certificate replacement response
+      ansible.builtin.assert:
+        that:
+          - replace_request.json.requestId is defined
+        fail_msg: >-
+          VCF Operations did not return a certificate
+          replacement workflow request ID.
+
+    - name: Store replacement workflow ID
+      ansible.builtin.set_fact:
+        replace_request_id: "{{ replace_request.json.requestId }}"
+
+    - name: Show certificate replacement workflow
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ID   : {{ replace_request_id }}"
+          - >-
+            Initial State :
+            {{ replace_request.json.state | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # Wait for replacement workflow
+    # -------------------------------------------------------------------------
+
+    - name: Wait for certificate replacement workflow
+      ansible.builtin.uri:
+        url: "{{ ops_api_base }}/workflows/requests/{{ replace_request_id }}"
+        method: GET
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: replace_workflow
+      until: replace_workflow.json.state == 'COMPLETED'
+      failed_when: >-
+        replace_workflow.json.state
+        in ['FAILED', 'ERROR', 'CANCELLED']
+      retries: 120
+      delay: 10
+
+    - name: Show completed replacement workflow
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ID : {{ replace_request_id }}"
+          - "State       : {{ replace_workflow.json.state }}"
+          - >-
+            Duration    :
+            {{ replace_workflow.json.duration | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # Verify certificate served by appliance
+    # -------------------------------------------------------------------------
+
+    - name: Read certificate from appliance
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo |
+        openssl s_client \
+          -connect "{{ appliance_fqdn }}:{{ verify_port }}" \
+          -servername "{{ appliance_fqdn }}" \
+          2>/dev/null |
+        openssl x509 \
+          -outform DER |
+        sha256sum |
+        awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: remote_certificate_hash
+      changed_when: false
+      failed_when: false
+      until:
+        - remote_certificate_hash.rc == 0
+        - remote_certificate_hash.stdout == local_certificate_hash.stdout
+      retries: 30
+      delay: 10
+
+    - name: Validate installed certificate
+      ansible.builtin.assert:
+        that:
+          - remote_certificate_hash.rc == 0
+          - remote_certificate_hash.stdout == local_certificate_hash.stdout
+        fail_msg: >-
+          VCF Operations reported the replacement as completed,
+          but {{ appliance_fqdn }} is not presenting the expected
+          certificate on port {{ verify_port }}.
+
+          Expected SHA256:
+          {{ local_certificate_hash.stdout }}
+
+          Presented SHA256:
+          {{ remote_certificate_hash.stdout | default('unavailable') }}
+
+    # -------------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------------
+
+    - name: Show certificate replacement result
+      ansible.builtin.debug:
+        msg:
+          - "Component        : {{ appliance_type }}"
+          - "FQDN             : {{ appliance_fqdn }}"
+          - "Certificate ID   : {{ certificate_resource_id }}"
+          - "Workflow ID      : {{ replace_request_id }}"
+          - "Workflow State   : {{ replace_workflow.json.state }}"
+          - "Certificate SHA256: {{ local_certificate_hash.stdout }}"
+          - "Endpoint SHA256   : {{ remote_certificate_hash.stdout }}"
+          - "Certificate match : yes"
+          - "Replacement       : successful"

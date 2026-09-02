@@ -1,0 +1,44 @@
+---
+certificate:
+  name: vcf09-vcsa
+  enabled: true
+
+  common_name: vcf09-vcsa.lab.box
+
+  subject:
+    country: DE
+    state: RLP
+    locality: NW
+    organization: SDN-Warrior
+    organizational_unit: SDN-Warrior
+
+  sans:
+    - vcf09-vcsa.lab.box
+
+  key:
+    type: rsa
+    size: 4096
+
+  acme:
+    server: https://acme.home.lab/
+    profile: vcf
+
+  challenge:
+    type: dns-01
+    provider: windows_dns
+    dns_server: dc1.home.lab
+    dns_zone: lab.box
+    ttl: 30
+    validation_resolvers:
+      - 192.168.5.2
+      - 192.168.5.4
+
+  deployment:
+    type: vcf_operations
+    ops_endpoint: vcf09-ops.lab.box
+    appliance: VCENTER
+    target: vcf09-vcsa.lab.box
+    validate_certs: false
+
+  renewal:
+    renew_before_days: 30

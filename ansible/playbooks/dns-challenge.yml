@@ -1,0 +1,235 @@
+---
+- name: Manage ACME DNS-01 challenge
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    certificate_file: >-
+      {{ playbook_dir }}/../../certificates/{{ certificate_name }}.yml
+    vault_file: "{{ playbook_dir }}/../vars/vault.yml"
+
+  tasks:
+    - name: Load certificate definition
+      ansible.builtin.include_vars:
+        file: "{{ certificate_file }}"
+
+    - name: Load Ansible Vault
+      ansible.builtin.include_vars:
+        file: "{{ vault_file }}"
+      no_log: true
+
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - certificate_name is defined
+          - dns_action is defined
+          - dns_action in ['present', 'absent']
+          - dns_identifier is defined
+          - dns_token is defined
+          - certificate.challenge.dns_server is defined
+          - certificate.challenge.dns_zone is defined
+          - certificate.challenge.ttl is defined
+          - certificate.challenge.validation_resolvers is defined
+          - windows_dns_user is defined
+          - windows_dns_password is defined
+        fail_msg: "DNS challenge configuration is incomplete."
+
+    - name: Normalize DNS identifier
+      ansible.builtin.set_fact:
+        normalized_identifier: >-
+          {{ dns_identifier | regex_replace('^\*\.', '') }}
+
+    - name: Calculate DNS challenge values
+      ansible.builtin.set_fact:
+        dns_writer: "{{ certificate.challenge.dns_server }}"
+        dns_zone: "{{ certificate.challenge.dns_zone }}"
+        dns_ttl: "{{ certificate.challenge.ttl }}"
+        dns_validation_resolvers: >-
+          {{ certificate.challenge.validation_resolvers }}
+        dns_challenge_fqdn: >-
+          _acme-challenge.{{ normalized_identifier }}
+
+    - name: Calculate relative DNS host name
+      ansible.builtin.set_fact:
+        dns_host_part: >-
+          {{
+            normalized_identifier
+            | regex_replace(
+                '\.' ~ (dns_zone | regex_escape) ~ '$',
+                ''
+              )
+          }}
+
+    - name: Build relative DNS challenge record name
+      ansible.builtin.set_fact:
+        dns_record_name: "_acme-challenge.{{ dns_host_part }}"
+
+    - name: Validate DNS identifier belongs to configured zone
+      ansible.builtin.assert:
+        that:
+          - normalized_identifier == dns_zone
+            or normalized_identifier.endswith('.' ~ dns_zone)
+        fail_msg: >-
+          {{ normalized_identifier }} does not belong to DNS zone
+          {{ dns_zone }}.
+
+    - name: Add configured Windows DNS server
+      ansible.builtin.add_host:
+        name: windows_dns_writer
+        ansible_host: "{{ dns_writer }}"
+        ansible_connection: winrm
+        ansible_port: 5986
+        ansible_winrm_scheme: https
+        ansible_winrm_transport: ntlm
+        ansible_winrm_server_cert_validation: validate
+        ansible_user: "{{ windows_dns_user }}"
+        ansible_password: "{{ windows_dns_password }}"
+      no_log: true
+
+    # =========================================================================
+    # Create DNS-01 challenge
+    # =========================================================================
+
+    - name: Create DNS-01 TXT challenge
+      when: dns_action == 'present'
+      block:
+        - name: Create exact TXT token
+          ansible.windows.win_powershell:
+            error_action: stop
+            script: |
+              param(
+                  [string]$Zone,
+                  [string]$Name,
+                  [string]$Token,
+                  [int]$TTL
+              )
+
+              $Ansible.Changed = $false
+
+              $Records = Get-DnsServerResourceRecord `
+                  -ZoneName $Zone `
+                  -Name $Name `
+                  -RRType TXT `
+                  -ErrorAction SilentlyContinue
+
+              $Exists = $Records | Where-Object {
+                  $_.RecordData.DescriptiveText -contains $Token
+              }
+
+              if (-not $Exists) {
+                  Add-DnsServerResourceRecord `
+                      -ZoneName $Zone `
+                      -Name $Name `
+                      -Txt `
+                      -DescriptiveText $Token `
+                      -TimeToLive ([TimeSpan]::FromSeconds($TTL))
+
+                  $Ansible.Changed = $true
+              }
+
+            parameters:
+              Zone: "{{ dns_zone }}"
+              Name: "{{ dns_record_name }}"
+              Token: "{{ dns_token }}"
+              TTL: "{{ dns_ttl }}"
+          delegate_to: windows_dns_writer
+
+        - name: Wait until TXT token is visible through all resolvers
+          ansible.builtin.command:
+            argv:
+              - dig
+              - "@{{ item }}"
+              - TXT
+              - "{{ dns_challenge_fqdn }}"
+              - "+short"
+          loop: "{{ dns_validation_resolvers }}"
+          register: dns_query
+          changed_when: false
+          until: >-
+            dns_token in
+            (dns_query.stdout | replace('"', ''))
+          retries: 15
+          delay: 2
+
+        # ---------------------------------------------------------------------
+        # The configured resolvers already see the TXT record at this point.
+        # Give the ACME server and its DNS resolver some additional time to
+        # expire a possible negative cache before validation starts.
+        # ---------------------------------------------------------------------
+
+        - name: Wait for ACME DNS propagation
+          ansible.builtin.pause:
+            seconds: 15
+
+        - name: DNS-01 TXT challenge ready
+          ansible.builtin.debug:
+            msg: >-
+              {{ dns_challenge_fqdn }} is visible through all
+              configured validation resolvers.
+
+    # =========================================================================
+    # Remove DNS-01 challenge
+    # =========================================================================
+
+    - name: Remove DNS-01 TXT challenge
+      when: dns_action == 'absent'
+      block:
+        - name: Remove only the matching TXT token
+          ansible.windows.win_powershell:
+            error_action: stop
+            script: |
+              param(
+                  [string]$Zone,
+                  [string]$Name,
+                  [string]$Token
+              )
+
+              $Ansible.Changed = $false
+
+              $Records = Get-DnsServerResourceRecord `
+                  -ZoneName $Zone `
+                  -Name $Name `
+                  -RRType TXT `
+                  -ErrorAction SilentlyContinue
+
+              $MatchingRecords = $Records | Where-Object {
+                  $_.RecordData.DescriptiveText -contains $Token
+              }
+
+              foreach ($Record in $MatchingRecords) {
+                  Remove-DnsServerResourceRecord `
+                      -ZoneName $Zone `
+                      -InputObject $Record `
+                      -Force
+
+                  $Ansible.Changed = $true
+              }
+
+            parameters:
+              Zone: "{{ dns_zone }}"
+              Name: "{{ dns_record_name }}"
+              Token: "{{ dns_token }}"
+          delegate_to: windows_dns_writer
+
+        - name: Wait until TXT token is removed from all resolvers
+          ansible.builtin.command:
+            argv:
+              - dig
+              - "@{{ item }}"
+              - TXT
+              - "{{ dns_challenge_fqdn }}"
+              - "+short"
+          loop: "{{ dns_validation_resolvers }}"
+          register: dns_cleanup_query
+          changed_when: false
+          until: >-
+            dns_token not in
+            (dns_cleanup_query.stdout | replace('"', ''))
+          retries: 15
+          delay: 2
+
+        - name: DNS-01 TXT challenge removed
+          ansible.builtin.debug:
+            msg: >-
+              {{ dns_challenge_fqdn }} challenge token has been removed.

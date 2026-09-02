@@ -1,0 +1,248 @@
+name: Auto Deploy New Certificate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "certificates/*.yml"
+
+jobs:
+  deploy:
+    runs-on: vcf-certmanager
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Detect newly added certificate definitions
+      #
+      # Only files that were ADDED by the push are selected.
+      # Modifying or deleting an existing certificate YAML does not trigger
+      # a certificate deployment.
+      # -----------------------------------------------------------------------
+
+      - name: Detect new certificate definitions
+        run: |
+          set -euo pipefail
+
+          NEW_CERTIFICATES="${GITHUB_WORKSPACE}/.new-certificates"
+
+          rm -f "${NEW_CERTIFICATES}"
+
+          python3 - "${GITHUB_EVENT_PATH}" > "${NEW_CERTIFICATES}" <<'PY'
+          import json
+          import sys
+
+          event_file = sys.argv[1]
+
+          with open(event_file, "r", encoding="utf-8") as handle:
+              event = json.load(handle)
+
+          certificates = set()
+
+          for commit in event.get("commits", []):
+              for path in commit.get("added", []):
+                  if (
+                      path.startswith("certificates/")
+                      and path.endswith(".yml")
+                  ):
+                      certificates.add(path)
+
+          for path in sorted(certificates):
+              print(path)
+          PY
+
+          echo "=================================================="
+          echo "New certificate definitions"
+          echo "=================================================="
+
+          if [ ! -s "${NEW_CERTIFICATES}" ]; then
+            echo "No new certificate YAML files found."
+            exit 0
+          fi
+
+          cat "${NEW_CERTIFICATES}"
+
+      # -----------------------------------------------------------------------
+      # Validate Vault access
+      # -----------------------------------------------------------------------
+
+      - name: Check Vault access
+        run: |
+          set -euo pipefail
+
+          NEW_CERTIFICATES="${GITHUB_WORKSPACE}/.new-certificates"
+
+          if [ ! -s "${NEW_CERTIFICATES}" ]; then
+            echo "No certificates to deploy."
+            exit 0
+          fi
+
+          ansible-vault view \
+            ansible/vars/vault.yml \
+            --vault-password-file /etc/vcf-certmanager/vault-pass \
+            >/dev/null
+
+          echo "Ansible Vault access: OK"
+
+      # -----------------------------------------------------------------------
+      # Validate and deploy newly added certificate definitions
+      #
+      # Multiple certificates added by a single push are processed
+      # sequentially.
+      # -----------------------------------------------------------------------
+
+      - name: Deploy new certificates
+        run: |
+          set -euo pipefail
+
+          NEW_CERTIFICATES="${GITHUB_WORKSPACE}/.new-certificates"
+
+          if [ ! -s "${NEW_CERTIFICATES}" ]; then
+            echo "No certificates to deploy."
+            exit 0
+          fi
+
+          while IFS= read -r CERTIFICATE_FILE; do
+
+            # The file may have been added and removed again within
+            # the same push.
+            if [ ! -f "${CERTIFICATE_FILE}" ]; then
+              echo "Skipping ${CERTIFICATE_FILE}: file no longer exists."
+              continue
+            fi
+
+            CERTIFICATE_NAME="$(
+              basename "${CERTIFICATE_FILE}" .yml
+            )"
+
+            echo
+            echo "=================================================="
+            echo "New certificate definition"
+            echo "=================================================="
+            echo "File       : ${CERTIFICATE_FILE}"
+            echo "Certificate: ${CERTIFICATE_NAME}"
+
+            # -----------------------------------------------------------------
+            # Validate certificate definition
+            #
+            # - YAML root must be a mapping
+            # - certificate section must exist
+            # - certificate.name must match the filename
+            # - enabled must be true or false
+            # - enabled defaults to true
+            # -----------------------------------------------------------------
+
+            ENABLED="$(
+              python3 -c '
+          import sys
+          import yaml
+
+          filename = sys.argv[1]
+          expected_name = sys.argv[2]
+
+          with open(filename, "r", encoding="utf-8") as handle:
+              data = yaml.safe_load(handle)
+
+          if not isinstance(data, dict):
+              raise SystemExit(
+                  f"{filename}: YAML root must be a mapping"
+              )
+
+          certificate = data.get("certificate")
+
+          if not isinstance(certificate, dict):
+              raise SystemExit(
+                  f"{filename}: certificate section is missing"
+              )
+
+          certificate_name = certificate.get("name")
+
+          if certificate_name != expected_name:
+              raise SystemExit(
+                  f"{filename}: certificate.name "
+                  f"{certificate_name!r} does not match "
+                  f"filename {expected_name!r}"
+              )
+
+          enabled = certificate.get("enabled", True)
+
+          if not isinstance(enabled, bool):
+              raise SystemExit(
+                  f"{filename}: certificate.enabled must be true or false"
+              )
+
+          print("true" if enabled else "false")
+          ' "${CERTIFICATE_FILE}" "${CERTIFICATE_NAME}"
+            )"
+
+            echo "Definition : valid"
+            echo "Enabled    : ${ENABLED}"
+
+            # -----------------------------------------------------------------
+            # Disabled certificate definitions remain in Git but are not
+            # deployed.
+            # -----------------------------------------------------------------
+
+            if [ "${ENABLED}" != "true" ]; then
+              echo "Certificate is disabled. Skipping deployment."
+              continue
+            fi
+
+            # -----------------------------------------------------------------
+            # Prepare runtime directory
+            # -----------------------------------------------------------------
+
+            RUNTIME_DIR="/etc/vcf-certmanager/certificates/${CERTIFICATE_NAME}"
+
+            mkdir -p "${RUNTIME_DIR}"
+            chmod 2770 "${RUNTIME_DIR}"
+
+            test -d "${RUNTIME_DIR}"
+            test -w "${RUNTIME_DIR}"
+
+            echo "Runtime directory: ${RUNTIME_DIR}"
+            echo "Runtime access   : OK"
+
+            # -----------------------------------------------------------------
+            # Run existing certificate pipeline
+            # -----------------------------------------------------------------
+
+            echo
+            echo "=================================================="
+            echo "Certificate deployment"
+            echo "Target: ${CERTIFICATE_NAME}"
+            echo "=================================================="
+
+            ./scripts/run-certificate-pipeline.sh "${CERTIFICATE_NAME}"
+
+            # -----------------------------------------------------------------
+            # Validate resulting certificate
+            # -----------------------------------------------------------------
+
+            CERTIFICATE_PATH="${RUNTIME_DIR}/cert.pem"
+
+            test -f "${CERTIFICATE_PATH}"
+
+            echo
+            echo "=================================================="
+            echo "Certificate deployment completed"
+            echo "=================================================="
+
+            openssl x509 \
+              -in "${CERTIFICATE_PATH}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint \
+              -sha256
+
+          done < "${NEW_CERTIFICATES}"

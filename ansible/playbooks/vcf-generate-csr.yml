@@ -1,0 +1,674 @@
+---
+- name: Generate CSR through VCF Operations
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    certificate_file: >-
+      {{ playbook_dir }}/../../certificates/{{ certificate_name }}.yml
+
+    vault_file: "{{ playbook_dir }}/../vars/vault.yml"
+
+    certificate_base_dir: >-
+      /etc/vcf-certmanager/certificates/{{ certificate_name }}
+
+    raw_csr_path: "{{ certificate_base_dir }}/request.raw.csr"
+    csr_path: "{{ certificate_base_dir }}/request.csr"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Load configuration
+    # -------------------------------------------------------------------------
+
+    - name: Load certificate definition
+      ansible.builtin.include_vars:
+        file: "{{ certificate_file }}"
+
+    - name: Load Ansible Vault
+      ansible.builtin.include_vars:
+        file: "{{ vault_file }}"
+      no_log: true
+
+    - name: Validate configuration
+      ansible.builtin.assert:
+        that:
+          - certificate_name is defined
+          - certificate.common_name is defined
+          - certificate.subject.country is defined
+          - certificate.subject.state is defined
+          - certificate.subject.locality is defined
+          - certificate.subject.organization is defined
+          - certificate.subject.organizational_unit is defined
+          - certificate.sans is defined
+          - certificate.sans | length > 0
+          - certificate.key.type == 'rsa'
+          - certificate.key.size in [2048, 3072, 4096]
+          - certificate.deployment.type == 'vcf_operations'
+          - certificate.deployment.ops_endpoint is defined
+          - certificate.deployment.appliance is defined
+          - certificate.deployment.target is defined
+          - vcf_ops_user is defined
+          - vcf_ops_password is defined
+        fail_msg: >-
+          VCF Operations certificate configuration is incomplete.
+
+    - name: Set VCF Operations facts
+      ansible.builtin.set_fact:
+        ops_endpoint: "{{ certificate.deployment.ops_endpoint }}"
+        appliance_type: "{{ certificate.deployment.appliance }}"
+        appliance_fqdn: "{{ certificate.deployment.target }}"
+        ops_validate_certs: >-
+          {{ certificate.deployment.validate_certs | default(true) | bool }}
+        key_size: "KEY_{{ certificate.key.size }}"
+        certificate_category: "TLS_CERT"
+        dns_sans: "{{ certificate.sans }}"
+        ip_sans: "{{ certificate.ip_sans | default([]) }}"
+
+    - name: Set VCF Operations API base URL
+      ansible.builtin.set_fact:
+        ops_api_base: "https://{{ ops_endpoint }}/suite-api/api"
+
+    # -------------------------------------------------------------------------
+    # Authentication
+    # -------------------------------------------------------------------------
+
+    - name: Build VCF Operations authentication request
+      ansible.builtin.set_fact:
+        ops_auth_body:
+          username: "{{ vcf_ops_user }}"
+          password: "{{ vcf_ops_password }}"
+      no_log: true
+
+    - name: Add authentication source when configured
+      ansible.builtin.set_fact:
+        ops_auth_body: >-
+          {{
+            ops_auth_body
+            | combine({'authSource': vcf_ops_auth_source})
+          }}
+      when:
+        - vcf_ops_auth_source is defined
+        - vcf_ops_auth_source | length > 0
+      no_log: true
+
+    - name: Acquire VCF Operations token
+      ansible.builtin.uri:
+        url: "{{ ops_api_base }}/auth/token/acquire"
+        method: POST
+        body_format: json
+        body: "{{ ops_auth_body }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: ops_login
+      no_log: true
+
+    - name: Store VCF Operations token
+      ansible.builtin.set_fact:
+        ops_token: "{{ ops_login.json.token }}"
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # Find TLS certificate resource
+    # -------------------------------------------------------------------------
+
+    - name: Query TLS certificate for component
+      ansible.builtin.uri:
+        url: >-
+          {{ ops_api_base }}/fleet-management/certificate-management/certificates/query
+        method: POST
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          appliance: "{{ appliance_type }}"
+          applianceFqdn: "{{ appliance_fqdn }}"
+          category: "{{ certificate_category }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: certificate_query
+
+    - name: Validate TLS certificate query result
+      ansible.builtin.assert:
+        that:
+          - certificate_query.json.vcfCertificateModels is defined
+          - certificate_query.json.vcfCertificateModels | length == 1
+        fail_msg: >-
+          Expected exactly one TLS certificate for
+          {{ appliance_type }} {{ appliance_fqdn }},
+          but found
+          {{
+            certificate_query.json.vcfCertificateModels
+            | default([])
+            | length
+          }}.
+
+    - name: Store selected TLS certificate
+      ansible.builtin.set_fact:
+        selected_certificate: >-
+          {{ certificate_query.json.vcfCertificateModels[0] }}
+
+    - name: Store certificate resource ID
+      ansible.builtin.set_fact:
+        certificate_resource_id: >-
+          {{ selected_certificate.certificateResourceKey }}
+
+    - name: Show selected TLS certificate
+      ansible.builtin.debug:
+        msg:
+          - "Component      : {{ appliance_type }}"
+          - "FQDN           : {{ appliance_fqdn }}"
+          - "Category       : {{ certificate_category }}"
+          - "Certificate ID : {{ certificate_resource_id }}"
+          - "DNS SANs       : {{ dns_sans | join(', ') }}"
+          - >-
+            IP SANs        :
+            {{
+              ip_sans | join(', ')
+              if ip_sans | length > 0
+              else 'none'
+            }}
+
+    # -------------------------------------------------------------------------
+    # Build CSR query
+    # -------------------------------------------------------------------------
+
+    - name: Build CSR query URL
+      ansible.builtin.set_fact:
+        csr_query_url: >-
+          {{
+            ops_api_base
+            ~ '/fleet-management/certificate-management/csrs'
+            ~ '?applianceType='
+            ~ (appliance_type | urlencode)
+            ~ '&applianceFqdn='
+            ~ (appliance_fqdn | urlencode)
+            ~ '&commonName='
+            ~ (certificate.common_name | urlencode)
+            ~ '&pageSize=100'
+          }}
+
+    # -------------------------------------------------------------------------
+    # Get current CSR state
+    # -------------------------------------------------------------------------
+
+    - name: Fetch current CSR before generation
+      ansible.builtin.uri:
+        url: "{{ csr_query_url }}"
+        method: GET
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: csr_before
+
+    - name: Filter current CSR entries
+      ansible.builtin.set_fact:
+        csr_entries_before: >-
+          {{
+            csr_before.json.certificateSignatureInfo
+            | default([])
+            | selectattr(
+                'commonName',
+                'equalto',
+                certificate.common_name
+              )
+            | selectattr(
+                'applianceType',
+                'equalto',
+                appliance_type
+              )
+            | list
+          }}
+
+    - name: Validate current CSR count
+      ansible.builtin.assert:
+        that:
+          - csr_entries_before | length <= 1
+        fail_msg: >-
+          More than one CSR exists for
+          {{ appliance_type }} {{ appliance_fqdn }}
+          with common name {{ certificate.common_name }}.
+
+    - name: Calculate previous raw CSR hash
+      ansible.builtin.set_fact:
+        previous_csr_hash: >-
+          {{ csr_entries_before[0].csr | hash('sha256') }}
+      when: csr_entries_before | length == 1
+
+    - name: Set empty previous CSR hash
+      ansible.builtin.set_fact:
+        previous_csr_hash: ""
+      when: csr_entries_before | length == 0
+
+    - name: Show current CSR state
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Existing CSR:
+            {{
+              'yes'
+              if csr_entries_before | length == 1
+              else 'no'
+            }}
+          - >-
+            Existing CSR ID:
+            {{
+              csr_entries_before[0].id
+              if csr_entries_before | length == 1
+              else 'none'
+            }}
+          - >-
+            Existing CSR SHA256:
+            {{
+              previous_csr_hash
+              if previous_csr_hash | length > 0
+              else 'none'
+            }}
+
+    # -------------------------------------------------------------------------
+    # Generate new CSR in VCF Operations
+    # -------------------------------------------------------------------------
+
+    - name: Generate CSR through VCF Operations
+      ansible.builtin.uri:
+        url: >-
+          {{ ops_api_base }}/fleet-management/certificate-management/csrs
+        method: POST
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          certificateId: "{{ certificate_resource_id }}"
+          generateCsrSpec:
+            commonName: "{{ certificate.common_name }}"
+            country: "{{ certificate.subject.country }}"
+            state: "{{ certificate.subject.state }}"
+            locality: "{{ certificate.subject.locality }}"
+            organization: "{{ certificate.subject.organization }}"
+            orgUnit: "{{ certificate.subject.organizational_unit }}"
+            keySize: "{{ key_size }}"
+            keyAlgorithm: "RSA"
+            subjectAltNames:
+              dns: "{{ dns_sans }}"
+              ip: "{{ ip_sans }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code:
+          - 200
+          - 201
+          - 202
+      register: csr_generate
+
+    - name: Validate CSR workflow response
+      ansible.builtin.assert:
+        that:
+          - csr_generate.json.requestId is defined
+        fail_msg: >-
+          VCF Operations did not return a CSR workflow request ID.
+
+    - name: Store CSR workflow request ID
+      ansible.builtin.set_fact:
+        csr_request_id: "{{ csr_generate.json.requestId }}"
+
+    - name: Show CSR workflow request
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ID   : {{ csr_request_id }}"
+          - >-
+            Initial State :
+            {{ csr_generate.json.state | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # Wait for VCF Operations workflow
+    # -------------------------------------------------------------------------
+
+    - name: Wait for CSR workflow to complete
+      ansible.builtin.uri:
+        url: "{{ ops_api_base }}/workflows/requests/{{ csr_request_id }}"
+        method: GET
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: csr_workflow
+      until: csr_workflow.json.state == 'COMPLETED'
+      failed_when: >-
+        csr_workflow.json.state
+        in ['FAILED', 'ERROR', 'CANCELLED']
+      retries: 60
+      delay: 5
+
+    - name: Show completed CSR workflow
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ID : {{ csr_request_id }}"
+          - "State       : {{ csr_workflow.json.state }}"
+          - >-
+            Duration    :
+            {{ csr_workflow.json.duration | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # Read updated CSR from VCF Operations
+    # -------------------------------------------------------------------------
+
+    - name: Fetch updated CSR after generation
+      ansible.builtin.uri:
+        url: "{{ csr_query_url }}"
+        method: GET
+        headers:
+          Authorization: "OpsToken {{ ops_token }}"
+        validate_certs: "{{ ops_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: csr_after
+
+    - name: Filter updated CSR entries
+      ansible.builtin.set_fact:
+        csr_entries_after: >-
+          {{
+            csr_after.json.certificateSignatureInfo
+            | default([])
+            | selectattr(
+                'commonName',
+                'equalto',
+                certificate.common_name
+              )
+            | selectattr(
+                'applianceType',
+                'equalto',
+                appliance_type
+              )
+            | list
+          }}
+
+    - name: Validate updated CSR count
+      ansible.builtin.assert:
+        that:
+          - csr_entries_after | length == 1
+        fail_msg: >-
+          Expected exactly one CSR after generation for
+          {{ appliance_type }} {{ appliance_fqdn }},
+          but found {{ csr_entries_after | length }}.
+
+    - name: Store updated CSR
+      ansible.builtin.set_fact:
+        generated_csr: "{{ csr_entries_after[0] }}"
+
+    - name: Validate returned CSR contains PEM markers
+      ansible.builtin.assert:
+        that:
+          - generated_csr.csr is defined
+          - generated_csr.csr | length > 0
+          - >-
+            '-----BEGIN CERTIFICATE REQUEST-----'
+            in generated_csr.csr
+          - >-
+            '-----END CERTIFICATE REQUEST-----'
+            in generated_csr.csr
+        fail_msg: >-
+          VCF Operations returned an invalid CSR.
+
+    # -------------------------------------------------------------------------
+    # Verify that VCF Operations actually changed the CSR
+    # -------------------------------------------------------------------------
+
+    - name: Calculate new raw CSR hash
+      ansible.builtin.set_fact:
+        new_csr_hash: "{{ generated_csr.csr | hash('sha256') }}"
+
+    - name: Validate CSR changed after generation
+      ansible.builtin.assert:
+        that:
+          - >-
+            previous_csr_hash | length == 0
+            or new_csr_hash != previous_csr_hash
+        fail_msg: >-
+          The CSR generation workflow completed successfully,
+          but the CSR returned by VCF Operations did not change.
+          CSR ID: {{ generated_csr.id | default('unknown') }}
+          SHA256: {{ new_csr_hash }}
+
+    - name: Show CSR change
+      ansible.builtin.debug:
+        msg:
+          - "CSR ID          : {{ generated_csr.id | default('unknown') }}"
+          - >-
+            Previous SHA256 :
+            {{
+              previous_csr_hash
+              if previous_csr_hash | length > 0
+              else 'none'
+            }}
+          - "New SHA256      : {{ new_csr_hash }}"
+          - "CSR changed     : yes"
+
+    # -------------------------------------------------------------------------
+    # Create local certificate directory
+    # -------------------------------------------------------------------------
+
+    - name: Create local certificate directory
+      ansible.builtin.file:
+        path: "{{ certificate_base_dir }}"
+        state: directory
+        mode: "2770"
+
+    # -------------------------------------------------------------------------
+    # Save raw VCF Operations API output
+    # -------------------------------------------------------------------------
+
+    - name: Save raw VCF Operations CSR
+      ansible.builtin.copy:
+        content: "{{ generated_csr.csr }}\n"
+        dest: "{{ raw_csr_path }}"
+        mode: "0660"
+
+    # -------------------------------------------------------------------------
+    # Canonicalize CSR
+    # -------------------------------------------------------------------------
+
+    - name: Canonicalize VCF Operations CSR
+      ansible.builtin.shell: |
+        set -e
+
+        python3 - "{{ raw_csr_path }}" "{{ csr_path }}" <<'PY'
+        import base64
+        import sys
+        from pathlib import Path
+
+        source = Path(sys.argv[1])
+        destination = Path(sys.argv[2])
+
+        begin = "-----BEGIN CERTIFICATE REQUEST-----"
+        end = "-----END CERTIFICATE REQUEST-----"
+
+        text = source.read_text(encoding="utf-8")
+
+        if begin not in text:
+            raise SystemExit(
+                "CSR does not contain BEGIN CERTIFICATE REQUEST marker"
+            )
+
+        if end not in text:
+            raise SystemExit(
+                "CSR does not contain END CERTIFICATE REQUEST marker"
+            )
+
+        body = text.split(begin, 1)[1].split(end, 1)[0]
+
+        # VCF Operations may return the CSR in a single line with
+        # whitespace between Base64 chunks.
+        body = "".join(body.split())
+
+        if not body:
+            raise SystemExit("CSR Base64 body is empty")
+
+        try:
+            der = base64.b64decode(body, validate=True)
+        except Exception as exc:
+            raise SystemExit(
+                f"CSR Base64 validation failed: {exc}"
+            )
+
+        if not der:
+            raise SystemExit("Decoded CSR is empty")
+
+        # Re-encode to canonical Base64.
+        canonical = base64.b64encode(der).decode("ascii")
+
+        lines = [
+            canonical[i:i + 64]
+            for i in range(0, len(canonical), 64)
+        ]
+
+        pem = (
+            begin
+            + "\n"
+            + "\n".join(lines)
+            + "\n"
+            + end
+            + "\n"
+        )
+
+        destination.write_text(
+            pem,
+            encoding="ascii"
+        )
+        PY
+
+        chmod 0644 "{{ csr_path }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Validate generated PEM
+    # -------------------------------------------------------------------------
+
+    - name: Verify saved CSR with OpenSSL
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -verify
+      register: csr_validation
+      changed_when: false
+
+    - name: Read CSR subject
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -subject
+      register: csr_subject
+      changed_when: false
+
+    - name: Read CSR details
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -in
+          - "{{ csr_path }}"
+          - -noout
+          - -text
+      register: csr_details
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Validate CSR contents
+    # -------------------------------------------------------------------------
+
+    - name: Validate CSR common name
+      ansible.builtin.assert:
+        that:
+          - certificate.common_name in csr_subject.stdout
+        fail_msg: >-
+          Generated CSR does not contain expected common name
+          {{ certificate.common_name }}.
+
+    - name: Validate CSR DNS SANs
+      ansible.builtin.assert:
+        that:
+          - item in csr_details.stdout
+        fail_msg: >-
+          Generated CSR does not contain expected DNS SAN
+          {{ item }}.
+      loop: "{{ dns_sans }}"
+
+    - name: Validate CSR IP SANs
+      ansible.builtin.assert:
+        that:
+          - "'IP Address:' ~ item in csr_details.stdout"
+        fail_msg: >-
+          Generated CSR does not contain expected IP SAN
+          {{ item }}.
+      loop: "{{ ip_sans }}"
+      when: ip_sans | length > 0
+
+    - name: Validate RSA key size
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              certificate.key.size | string
+              ~ ' bit'
+            )
+            in csr_details.stdout
+        fail_msg: >-
+          Generated CSR does not use the expected
+          {{ certificate.key.size }} bit RSA key.
+
+    # -------------------------------------------------------------------------
+    # Calculate canonical CSR fingerprint
+    # -------------------------------------------------------------------------
+
+    - name: Calculate canonical CSR SHA256
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - "{{ csr_path }}"
+      register: canonical_csr_sha256
+      changed_when: false
+
+    - name: Store canonical CSR SHA256
+      ansible.builtin.set_fact:
+        canonical_csr_hash: >-
+          {{ canonical_csr_sha256.stdout.split()[0] }}
+
+    # -------------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------------
+
+    - name: Show generated CSR information
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ID       : {{ csr_request_id }}"
+          - "CSR ID            : {{ generated_csr.id | default('unknown') }}"
+          - "Raw CSR stored at : {{ raw_csr_path }}"
+          - "CSR stored at     : {{ csr_path }}"
+          - "Subject           : {{ csr_subject.stdout }}"
+          - "DNS SANs          : {{ dns_sans | join(', ') }}"
+          - >-
+            IP SANs           :
+            {{
+              ip_sans | join(', ')
+              if ip_sans | length > 0
+              else 'none'
+            }}
+          - "Raw CSR SHA256    : {{ new_csr_hash }}"
+          - "PEM CSR SHA256    : {{ canonical_csr_hash }}"
+          - "Private key       : managed by VCF Operations"
+          - "CSR validation    : successful"
