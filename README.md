@@ -1,6 +1,7 @@
-# VCF Certificate Automation
+# C.E.R.B.E.R.U.S.: A Let's Encrypt Automation Pipeline for VCF 9.1
 
 Automated certificate lifecycle management for VMware Cloud Foundation using VCF Operations, Ansible and ACME.
+C.E.R.B.E.R.U.S. — short for Certificate Exchange, Renewal & Backend Engine for Reliable Unified Security. 
 
 The project automates the complete certificate lifecycle from CSR generation to certificate deployment and endpoint validation.
 
