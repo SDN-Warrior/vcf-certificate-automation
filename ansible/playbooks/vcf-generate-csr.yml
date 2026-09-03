@@ -17,6 +17,7 @@
     csr_path: "{{ certificate_base_dir }}/request.csr"
 
   tasks:
+
     # -------------------------------------------------------------------------
     # Load configuration
     # -------------------------------------------------------------------------
@@ -174,6 +175,8 @@
 
     # -------------------------------------------------------------------------
     # Build CSR query
+    #
+    # Keep the existing server-side filtering for classic VCF components.
     # -------------------------------------------------------------------------
 
     - name: Build CSR query URL
@@ -192,7 +195,11 @@
           }}
 
     # -------------------------------------------------------------------------
-    # Get current CSR state
+    # Get current CSR inventory
+    #
+    # Prefer the certificate resource ID when the API exposes it on CSR
+    # objects. Older VCF 9.1 versions may not expose it, so the original
+    # commonName + applianceType matching remains available as fallback.
     # -------------------------------------------------------------------------
 
     - name: Fetch current CSR before generation
@@ -206,9 +213,24 @@
         status_code: 200
       register: csr_before
 
-    - name: Filter current CSR entries
+    - name: Find current CSRs by certificate resource ID
       ansible.builtin.set_fact:
-        csr_entries_before: >-
+        csr_entries_before_by_certificate_id: >-
+          {{
+            csr_before.json.certificateSignatureInfo
+            | default([])
+            | selectattr('certificateId', 'defined')
+            | selectattr(
+                'certificateId',
+                'equalto',
+                certificate_resource_id
+              )
+            | list
+          }}
+
+    - name: Find current CSRs using legacy matching
+      ansible.builtin.set_fact:
+        csr_entries_before_legacy: >-
           {{
             csr_before.json.certificateSignatureInfo
             | default([])
@@ -225,50 +247,15 @@
             | list
           }}
 
-    - name: Validate current CSR count
-      ansible.builtin.assert:
-        that:
-          - csr_entries_before | length <= 1
-        fail_msg: >-
-          More than one CSR exists for
-          {{ appliance_type }} {{ appliance_fqdn }}
-          with common name {{ certificate.common_name }}.
-
-    - name: Calculate previous raw CSR hash
-      ansible.builtin.set_fact:
-        previous_csr_hash: >-
-          {{ csr_entries_before[0].csr | hash('sha256') }}
-      when: csr_entries_before | length == 1
-
-    - name: Set empty previous CSR hash
-      ansible.builtin.set_fact:
-        previous_csr_hash: ""
-      when: csr_entries_before | length == 0
-
-    - name: Show current CSR state
+    - name: Show CSR inventory before generation
       ansible.builtin.debug:
         msg:
           - >-
-            Existing CSR:
-            {{
-              'yes'
-              if csr_entries_before | length == 1
-              else 'no'
-            }}
+            Certificate ID matches :
+            {{ csr_entries_before_by_certificate_id | length }}
           - >-
-            Existing CSR ID:
-            {{
-              csr_entries_before[0].id
-              if csr_entries_before | length == 1
-              else 'none'
-            }}
-          - >-
-            Existing CSR SHA256:
-            {{
-              previous_csr_hash
-              if previous_csr_hash | length > 0
-              else 'none'
-            }}
+            Legacy matches         :
+            {{ csr_entries_before_legacy | length }}
 
     # -------------------------------------------------------------------------
     # Generate new CSR in VCF Operations
@@ -355,7 +342,7 @@
             {{ csr_workflow.json.duration | default('unknown') }}
 
     # -------------------------------------------------------------------------
-    # Read updated CSR from VCF Operations
+    # Read updated CSR inventory
     # -------------------------------------------------------------------------
 
     - name: Fetch updated CSR after generation
@@ -369,9 +356,24 @@
         status_code: 200
       register: csr_after
 
-    - name: Filter updated CSR entries
+    - name: Find updated CSRs by certificate resource ID
       ansible.builtin.set_fact:
-        csr_entries_after: >-
+        csr_entries_after_by_certificate_id: >-
+          {{
+            csr_after.json.certificateSignatureInfo
+            | default([])
+            | selectattr('certificateId', 'defined')
+            | selectattr(
+                'certificateId',
+                'equalto',
+                certificate_resource_id
+              )
+            | list
+          }}
+
+    - name: Find updated CSRs using legacy matching
+      ansible.builtin.set_fact:
+        csr_entries_after_legacy: >-
           {{
             csr_after.json.certificateSignatureInfo
             | default([])
@@ -388,18 +390,133 @@
             | list
           }}
 
-    - name: Validate updated CSR count
+    # -------------------------------------------------------------------------
+    # Select matching strategy by API capability
+    #
+    # If the CSR returned by VCF references the certificate resource that was
+    # supplied to the generation request, use that relationship.
+    #
+    # Otherwise fall back to the original VCF 9.1 matching behavior.
+    # -------------------------------------------------------------------------
+
+    - name: Select CSR matching strategy
+      ansible.builtin.set_fact:
+        csr_match_mode: >-
+          {{
+            'certificateId'
+            if csr_entries_after_by_certificate_id | length > 0
+            else 'legacy'
+          }}
+
+    - name: Select effective CSR inventories
+      ansible.builtin.set_fact:
+        csr_entries_before: >-
+          {{
+            csr_entries_before_by_certificate_id
+            if csr_match_mode == 'certificateId'
+            else csr_entries_before_legacy
+          }}
+        csr_entries_after: >-
+          {{
+            csr_entries_after_by_certificate_id
+            if csr_match_mode == 'certificateId'
+            else csr_entries_after_legacy
+          }}
+
+    - name: Show selected CSR matching strategy
+      ansible.builtin.debug:
+        msg:
+          - "CSR match mode      : {{ csr_match_mode }}"
+          - "Certificate ID      : {{ certificate_resource_id }}"
+          - "Matching CSRs before: {{ csr_entries_before | length }}"
+          - "Matching CSRs after : {{ csr_entries_after | length }}"
+
+    - name: Validate matching CSR exists after generation
       ansible.builtin.assert:
         that:
-          - csr_entries_after | length == 1
+          - csr_entries_after | length >= 1
         fail_msg: >-
-          Expected exactly one CSR after generation for
+          No matching CSR was found after generation for
+          {{ appliance_type }} {{ appliance_fqdn }}.
+          Match mode: {{ csr_match_mode }}.
+          Certificate ID: {{ certificate_resource_id }}.
+
+    # -------------------------------------------------------------------------
+    # Identify the CSR generated by this workflow
+    #
+    # Do not assume that exactly one CSR object exists. VCF may update an
+    # existing object or retain historical objects.
+    #
+    # Compare the raw CSR values before and after generation and require
+    # exactly one new or changed CSR.
+    # -------------------------------------------------------------------------
+
+    - name: Store previous raw CSR values
+      ansible.builtin.set_fact:
+        previous_csr_values: >-
+          {{
+            csr_entries_before
+            | selectattr('csr', 'defined')
+            | map(attribute='csr')
+            | list
+          }}
+
+    - name: Initialize changed CSR candidate list
+      ansible.builtin.set_fact:
+        changed_csr_candidates: []
+
+    - name: Find new or changed CSR candidates
+      ansible.builtin.set_fact:
+        changed_csr_candidates: >-
+          {{ changed_csr_candidates + [item] }}
+      loop: "{{ csr_entries_after }}"
+      loop_control:
+        label: "{{ item.id | default('unknown') }}"
+      when:
+        - item.csr is defined
+        - item.csr | length > 0
+        - item.csr not in previous_csr_values
+
+    - name: Validate exactly one CSR changed
+      ansible.builtin.assert:
+        that:
+          - changed_csr_candidates | length == 1
+        fail_msg: >-
+          Expected exactly one new or changed CSR after generation for
           {{ appliance_type }} {{ appliance_fqdn }},
-          but found {{ csr_entries_after | length }}.
+          but found {{ changed_csr_candidates | length }}.
+          Match mode: {{ csr_match_mode }}.
+          Matching CSRs before: {{ csr_entries_before | length }}.
+          Matching CSRs after: {{ csr_entries_after | length }}.
 
     - name: Store updated CSR
       ansible.builtin.set_fact:
-        generated_csr: "{{ csr_entries_after[0] }}"
+        generated_csr: "{{ changed_csr_candidates[0] }}"
+
+    # -------------------------------------------------------------------------
+    # Validate CSR identity
+    # -------------------------------------------------------------------------
+
+    - name: Validate generated CSR identity
+      ansible.builtin.assert:
+        that:
+          - generated_csr.commonName is defined
+          - generated_csr.commonName == certificate.common_name
+          - >-
+            (generated_csr.applianceType | default(appliance_type))
+            == appliance_type
+          - >-
+            (generated_csr.applianceHostname | default(appliance_fqdn))
+            == appliance_fqdn
+          - >-
+            csr_match_mode != 'certificateId'
+            or (
+              generated_csr.certificateId is defined
+              and generated_csr.certificateId == certificate_resource_id
+            )
+        fail_msg: >-
+          The CSR returned by VCF Operations does not match the requested
+          certificate resource or endpoint.
 
     - name: Validate returned CSR contains PEM markers
       ansible.builtin.assert:
@@ -423,12 +540,22 @@
       ansible.builtin.set_fact:
         new_csr_hash: "{{ generated_csr.csr | hash('sha256') }}"
 
+    - name: Set default previous CSR hash
+      ansible.builtin.set_fact:
+        previous_csr_hash: ""
+
+    - name: Calculate previous raw CSR hash when exactly one existed
+      ansible.builtin.set_fact:
+        previous_csr_hash: >-
+          {{ csr_entries_before[0].csr | hash('sha256') }}
+      when:
+        - csr_entries_before | length == 1
+        - csr_entries_before[0].csr is defined
+
     - name: Validate CSR changed after generation
       ansible.builtin.assert:
         that:
-          - >-
-            previous_csr_hash | length == 0
-            or new_csr_hash != previous_csr_hash
+          - generated_csr.csr not in previous_csr_values
         fail_msg: >-
           The CSR generation workflow completed successfully,
           but the CSR returned by VCF Operations did not change.
@@ -438,16 +565,24 @@
     - name: Show CSR change
       ansible.builtin.debug:
         msg:
-          - "CSR ID          : {{ generated_csr.id | default('unknown') }}"
+          - "CSR match mode    : {{ csr_match_mode }}"
+          - "CSR ID            : {{ generated_csr.id | default('unknown') }}"
           - >-
-            Previous SHA256 :
+            CSR Certificate ID:
+            {{ generated_csr.certificateId | default('not provided') }}
+          - >-
+            Previous SHA256   :
             {{
               previous_csr_hash
               if previous_csr_hash | length > 0
-              else 'none'
+              else (
+                'multiple previous CSRs'
+                if csr_entries_before | length > 1
+                else 'none'
+              )
             }}
-          - "New SHA256      : {{ new_csr_hash }}"
-          - "CSR changed     : yes"
+          - "New SHA256        : {{ new_csr_hash }}"
+          - "CSR changed       : yes"
 
     # -------------------------------------------------------------------------
     # Create local certificate directory
@@ -543,8 +678,10 @@
         PY
 
         chmod 0644 "{{ csr_path }}"
+
       args:
         executable: /bin/bash
+
       changed_when: true
 
     # -------------------------------------------------------------------------
@@ -655,20 +792,24 @@
     - name: Show generated CSR information
       ansible.builtin.debug:
         msg:
-          - "Workflow ID       : {{ csr_request_id }}"
-          - "CSR ID            : {{ generated_csr.id | default('unknown') }}"
-          - "Raw CSR stored at : {{ raw_csr_path }}"
-          - "CSR stored at     : {{ csr_path }}"
-          - "Subject           : {{ csr_subject.stdout }}"
-          - "DNS SANs          : {{ dns_sans | join(', ') }}"
+          - "Workflow ID        : {{ csr_request_id }}"
+          - "CSR match mode     : {{ csr_match_mode }}"
+          - "CSR ID             : {{ generated_csr.id | default('unknown') }}"
           - >-
-            IP SANs           :
+            CSR Certificate ID :
+            {{ generated_csr.certificateId | default('not provided') }}
+          - "Raw CSR stored at  : {{ raw_csr_path }}"
+          - "CSR stored at      : {{ csr_path }}"
+          - "Subject            : {{ csr_subject.stdout }}"
+          - "DNS SANs           : {{ dns_sans | join(', ') }}"
+          - >-
+            IP SANs            :
             {{
               ip_sans | join(', ')
               if ip_sans | length > 0
               else 'none'
             }}
-          - "Raw CSR SHA256    : {{ new_csr_hash }}"
-          - "PEM CSR SHA256    : {{ canonical_csr_hash }}"
-          - "Private key       : managed by VCF Operations"
-          - "CSR validation    : successful"
+          - "Raw CSR SHA256     : {{ new_csr_hash }}"
+          - "PEM CSR SHA256     : {{ canonical_csr_hash }}"
+          - "Private key        : managed by VCF Operations"
+          - "CSR validation     : successful"
