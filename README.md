@@ -1,4 +1,4 @@
-# C.E.R.B.E.R.U.S.: A Let's Encrypt Automation Pipeline for VCF 9.1
+# C.E.R.B.E.R.U.S.: A Let's Encrypt Automation Pipeline for VCF 9.1.X
 
 Automated certificate lifecycle management for VMware Cloud Foundation using VCF Operations, Ansible and ACME.
 C.E.R.B.E.R.U.S. — short for Certificate Exchange, Renewal & Backend Engine for Reliable Unified Security. 
@@ -1032,6 +1032,18 @@ Renewal should require no manual certificate handling.
 A completed API workflow is not enough:
 the final endpoint certificate must also be verified.
 ```
+
+---
+
+# Release Notes
+
+VCF Certificate Automation v1.0.1
+
+Fixes CSR selection when VCF Operations exposes multiple CSR objects for the same endpoint.
+
+CSR matching now prefers the certificate resource ID returned by VCF Operations, while retaining the legacy matching behavior for VCF 9.1 API responses that do not expose certificateId.
+
+Tested with VCF 9.1.1 against both VCF Management Services and classic VCF components.
 
 ---
 
