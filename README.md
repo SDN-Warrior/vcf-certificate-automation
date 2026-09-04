@@ -1,6 +1,7 @@
-# VCF Certificate Automation
+# C.E.R.B.E.R.U.S.: A Let's Encrypt Automation Pipeline for VCF 9.1
 
 Automated certificate lifecycle management for VMware Cloud Foundation using VCF Operations, Ansible and ACME.
+C.E.R.B.E.R.U.S. — short for Certificate Exchange, Renewal & Backend Engine for Reliable Unified Security. 
 
 The project automates the complete certificate lifecycle from CSR generation to certificate deployment and endpoint validation.
 
@@ -35,12 +36,6 @@ VCF Operations generates and retains the private key and provides only the CSR f
 
 # Important Notice
 
-This project was developed over several days with the assistance of ChatGPT.
-
-The automation, API calls, certificate workflows and resulting certificates were reviewed, validated and tested in my lab to the best of my knowledge and ability.
-
-That does **not** mean the code is free of errors.
-
 Certificate replacement is a security-sensitive operation and mistakes can potentially affect the availability or manageability of your VCF environment.
 
 For that reason, I currently **do not recommend using this project unchanged in a production environment**.
@@ -53,19 +48,6 @@ Reference implementation
 Learning resource
 Starting point for your own automation
 ```
-
-Review the code, understand what it does and test it thoroughly in your own environment before considering any productive use.
-
-The project is provided **as-is**.
-
-There is no warranty, no guarantee of functionality and no entitlement to support, updates, bug fixes or compatibility with future VCF releases.
-
-If it works for you: great.
-
-If you improve it: even better.
-
-But please understand the code before allowing it to replace certificates in an environment you care about.
-
 ---
 
 # Why this project exists
