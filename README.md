@@ -138,13 +138,7 @@ workflow.
 The automation currently supports the following VCF certificate appliance types:
 
 ```text
-VCENTER
-SDDC_MANAGER
-NSXT_MANAGER
-ESX
-VCF_OPERATIONS
-IDENTITY_BROKER
-VCF_SERVICES_RUNTIME
+see Changelog for full information
 ```
 
 This includes certificates for components such as:
@@ -1037,14 +1031,7 @@ the final endpoint certificate must also be verified.
 
 # Release Notes
 
-VCF Certificate Automation v1.0.1
-
-Fixes CSR selection when VCF Operations exposes multiple CSR objects for the same endpoint.
-
-CSR matching now prefers the certificate resource ID returned by VCF Operations, while retaining the legacy matching behavior for VCF 9.1 API responses that do not expose certificateId.
-
-Tested with VCF 9.1.1 against both VCF Management Services and classic VCF components.
-
+See [CHANGELOG.md](CHANGELOG.md) for release history and changes.
 ---
 
 # Disclaimer and Support

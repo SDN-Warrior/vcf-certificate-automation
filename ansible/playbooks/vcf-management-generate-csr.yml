@@ -48,7 +48,7 @@
           - certificate.deployment.type == 'vcf_operations'
           - certificate.deployment.ops_endpoint is defined
           - certificate.deployment.appliance is defined
-          - certificate.deployment.appliance in ['VCF_OPERATIONS', 'IDENTITY_BROKER', 'VCF_SERVICES_RUNTIME', 'ESX']
+          - certificate.deployment.appliance in ['VCF_AUTOMATION','LOG_MANAGEMENT','VCF_OPERATIONS','VCF_OPS_NETWORK','IDENTITY_BROKER','VCF_OPS_HCX','ESX','VCF_SERVICES_RUNTIME','AVI_LOAD_BALANCER']
           - certificate.deployment.target is defined
           - vcf_ops_user is defined
           - vcf_ops_password is defined

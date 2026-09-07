@@ -12,82 +12,96 @@ if [[ ! -f "${CERTIFICATE_FILE}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Read deployment type from certificate definition.
+# Read appliance type from the certificate definition and select the
+# appropriate VCF certificate pipeline.
+#
+# VCF component pipeline:
+#   VCENTER
+#   SDDC_MANAGER
+#   NSXT_MANAGER
+#
+# VCF management pipeline:
+#   VCF_AUTOMATION
+#   LOG_MANAGEMENT
+#   VCF_OPERATIONS
+#   VCF_OPS_NETWORK
+#   IDENTITY_BROKER
+#   VCF_OPS_HCX
+#   ESX
+#   VCF_SERVICES_RUNTIME
+#   AVI_LOAD_BALANCER
 # ---------------------------------------------------------------------------
 
-APPLIANCE="$(
+PIPELINE_INFO="$(
   python3 - "${CERTIFICATE_FILE}" <<'PY'
 import sys
 import yaml
 
 certificate_file = sys.argv[1]
 
+component_appliances = {
+    "VCENTER",
+    "SDDC_MANAGER",
+    "NSXT_MANAGER",
+}
+
+management_appliances = {
+    "VCF_AUTOMATION",
+    "LOG_MANAGEMENT",
+    "VCF_OPERATIONS",
+    "VCF_OPS_NETWORK",
+    "IDENTITY_BROKER",
+    "VCF_OPS_HCX",
+    "ESX",
+    "VCF_SERVICES_RUNTIME",
+    "AVI_LOAD_BALANCER",
+}
+
 with open(certificate_file, "r", encoding="utf-8") as handle:
     data = yaml.safe_load(handle)
 
 if not isinstance(data, dict):
-    raise SystemExit("Invalid certificate YAML root")
+    raise SystemExit("ERROR: Invalid certificate YAML root")
 
 certificate = data.get("certificate")
 
 if not isinstance(certificate, dict):
-    raise SystemExit("Missing certificate definition")
+    raise SystemExit("ERROR: Missing certificate definition")
 
 deployment = certificate.get("deployment")
 
 if not isinstance(deployment, dict):
-    raise SystemExit("Missing deployment definition")
+    raise SystemExit("ERROR: Missing deployment definition")
 
 appliance = deployment.get("appliance")
 
 if not isinstance(appliance, str) or not appliance:
-    raise SystemExit("Missing deployment.appliance")
+    raise SystemExit("ERROR: Missing deployment.appliance")
+
+if appliance in component_appliances:
+    playbook = "ansible/playbooks/vcf-certificate.yml"
+    pipeline = "VCF component"
+
+elif appliance in management_appliances:
+    playbook = "ansible/playbooks/vcf-management-certificate.yml"
+    pipeline = "VCF management"
+
+else:
+    raise SystemExit(
+        f"ERROR: Unsupported VCF appliance type: {appliance}"
+    )
 
 print(appliance)
+print(playbook)
+print(pipeline)
 PY
 )"
 
-# ---------------------------------------------------------------------------
-# Select certificate pipeline.
-#
-# Existing VCF component path:
-#
-#   VCENTER
-#   SDDC_MANAGER
-#   NSXT_MANAGER
-#
-# New VCF Management path:
-#
-#   VCF_OPERATIONS
-#   IDENTITY_BROKER
-#   VCF_SERVICES_RUNTIME
-# ---------------------------------------------------------------------------
+mapfile -t PIPELINE_DATA <<< "${PIPELINE_INFO}"
 
-case "${APPLIANCE}" in
-
-  VCENTER|SDDC_MANAGER|NSXT_MANAGER)
-
-    CERTIFICATE_PLAYBOOK="ansible/playbooks/vcf-certificate.yml"
-    PIPELINE="VCF component"
-
-    ;;
-
-  VCF_OPERATIONS|IDENTITY_BROKER|VCF_SERVICES_RUNTIME|ESX)
-
-    CERTIFICATE_PLAYBOOK="ansible/playbooks/vcf-management-certificate.yml"
-    PIPELINE="VCF management"
-
-    ;;
-
-  *)
-
-    echo "ERROR: Unsupported VCF appliance type:"
-    echo "       ${APPLIANCE}"
-    exit 1
-
-    ;;
-
-esac
+APPLIANCE="${PIPELINE_DATA[0]}"
+CERTIFICATE_PLAYBOOK="${PIPELINE_DATA[1]}"
+PIPELINE="${PIPELINE_DATA[2]}"
 
 if [[ ! -f "${CERTIFICATE_PLAYBOOK}" ]]; then
   echo "ERROR: Certificate playbook not found:"
