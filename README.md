@@ -3,6 +3,10 @@
 Automated certificate lifecycle management for VMware Cloud Foundation using VCF Operations, Ansible and ACME.
 C.E.R.B.E.R.U.S. — short for Certificate Exchange, Renewal & Backend Engine for Reliable Unified Security. 
 
+## Warning: 
+
+Do not replace the VCF Identity Broker certificate with C.e.r.b.e.r.u.s. on VCF 9.1.1. Certificate replacement can break subsequent SSO/OAuth client configuration. The issue is reproducible even when using the built-in Microsoft CA workflow, so it does not appear to be specific to my Pipeline. Keep the default vIDB certificate until this issue is resolved. However, at this point, I can't say whether this is a bug in VCF 9.1.1 or if it's due to my API calls for replacing the VIDB certificate. All other certificates work without any problems.
+
 The project automates the complete certificate lifecycle from CSR generation to certificate deployment and endpoint validation.
 
 ```text
