@@ -5,7 +5,7 @@ C.E.R.B.E.R.U.S. — short for Certificate Exchange, Renewal & Backend Engine fo
 
 ## Warning: 
 
-Do not replace the VCF Identity Broker certificate with C.e.r.b.e.r.u.s. on VCF 9.1.1. Certificate replacement can break subsequent SSO/OAuth client configuration. The issue is reproducible even when using the built-in Microsoft CA workflow, so it does not appear to be specific to my Pipeline. Keep the default vIDB certificate until this issue is resolved. However, at this point, I can't say whether this is a bug in VCF 9.1.1 or if it's due to my API calls for replacing the VIDB certificate. All other certificates work without any problems.
+Do not replace the VCF Identity Broker certificate with C.E.R.B.E.R.U.S. on VCF 9.1.X. Certificate replacement can break subsequent SSO/OAuth client configuration. The current suspicion is that VIDM cannot work with the Lets Encrypt CA chain. The problem persists even if you replace the certificate with one issued by a Microsoft CA. The only fix I've found so far is to uninstall the VIDB components using the Broadcom script, redeploy them, and then use the Windows CA via the built-in workflow. Unfortunately, this isn't very satisfactory.
 
 The project automates the complete certificate lifecycle from CSR generation to certificate deployment and endpoint validation.
 
