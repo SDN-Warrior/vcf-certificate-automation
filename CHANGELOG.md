@@ -6,6 +6,77 @@ All notable changes to C.E.R.B.E.R.U.S. are documented in this file.
 
 ## [v1.0.3] - 2026-10-17
 
+### Installing ISRG Root YR
+
+C.E.R.B.E.R.U.S. uses the self-signed ISRG Root YR certificate
+as the trust anchor for the selected Let's Encrypt Generation Y chain.
+
+The certificate must exist locally on the CertManager because
+the certificate definitions reference it through `deployment.root_ca_file`.
+
+Download the official self-signed certificate from Let's Encrypt:
+
+https://letsencrypt.org/certs/gen-y/root-yr.pem
+
+Install and verify the certificate on the CertManager:
+
+~~bash
+curl -fsSL \
+  https://letsencrypt.org/certs/gen-y/root-yr.pem \
+  -o /tmp/ISRG_Root_YR.pem
+
+EXPECTED="E5:7B:7E:6F:15:0C:41:91:02:E8:D5:C0:55:72:9F:F9:67:B9:D1:A8:29:BF:00:CE:C8:9C:A6:04:EB:F4:A8:6F"
+
+ACTUAL=$(
+  openssl x509 \
+    -in /tmp/ISRG_Root_YR.pem \
+    -noout -fingerprint -sha256 |
+    cut -d= -f2
+)
+
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "ERROR: Unexpected Root CA fingerprint"
+  exit 1
+fi
+
+sudo install -m 0644 \
+  /tmp/ISRG_Root_YR.pem \
+  /etc/ssl/certs/ISRG_Root_YR.pem
+
+openssl x509 \
+  -in /etc/ssl/certs/ISRG_Root_YR.pem \
+  -noout -subject -issuer -fingerprint -sha256
+~~
+
+The expected subject and issuer are identical:
+`C=US, O=ISRG, CN=Root YR`.
+
+Use the self-signed Root YR certificate, not the variant
+cross-signed by ISRG Root X1.
+
+No modification of the Ubuntu system trust store is required
+solely to provide this certificate file to the pipeline.
+
+Configure Certbot in `/etc/letsencrypt/cli.ini`:
+
+~~ini
+preferred-chain = Root YR
+~~
+
+Certificate definitions must reference:
+
+~~yaml
+deployment:
+  root_ca_file: /etc/ssl/certs/ISRG_Root_YR.pem
+~~
+
+Target VCF components may require separate CA trust registration.
+The local file does not automatically establish trust on remote appliances.
+
+Note that Certbot's `preferred-chain` setting is a preference;
+the returned chain must still be verified.
+
+
 ### Changed
 
 - Added a 180-second settling period after each successful certificate replacement.
@@ -23,6 +94,55 @@ For Let's Encrypt Generation Y certificates, configure Certbot in /etc/letsencry
 The ISRG Root YR certificate must be available on the CertManager host:
 
     /etc/ssl/certs/ISRG_Root_YR.pem
+
+### Downloading and Installing ISRG Root YR
+
+The self-signed ISRG Root YR certificate must be downloaded and stored
+locally on the CertManager host before running the certificate pipeline.
+
+Official Let's Encrypt certificate source:
+https://letsencrypt.org/certificates/
+
+Download the self-signed ISRG Root YR certificate, validate its SHA-256
+fingerprint, and install it at the location expected by C.E.R.B.E.R.U.S.:
+
+~~bash
+set -e
+
+curl -fsSL \
+  https://letsencrypt.org/certs/gen-y/root-yr.pem \
+  -o /tmp/ISRG_Root_YR.pem
+
+EXPECTED="E5:7B:7E:6F:15:0C:41:91:02:E8:D5:C0:55:72:9F:F9:67:B9:D1:A8:29:BF:00:CE:C8:9C:A6:04:EB:F4:A8:6F"
+
+ACTUAL=$(
+  openssl x509 -in /tmp/ISRG_Root_YR.pem \
+    -noout -fingerprint -sha256 | cut -d= -f2
+)
+
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "ERROR: Unexpected Root CA fingerprint"
+  exit 1
+fi
+
+sudo install -m 0644 \
+  /tmp/ISRG_Root_YR.pem \
+  /etc/ssl/certs/ISRG_Root_YR.pem
+
+rm -f /tmp/ISRG_Root_YR.pem
+~~
+
+The expected certificate subject is `C=US, O=ISRG, CN=Root YR`.
+
+Use the self-signed Root YR certificate rather than the certificate
+cross-signed by ISRG Root X1.
+
+Adding the certificate to the operating system's global trust store
+is not required solely for the C.E.R.B.E.R.U.S. pipeline. However,
+target VCF components may require separate trust configuration.
+
+Certbot's `preferred-chain` setting is a preference, not a guarantee.
+Always validate the resulting certificate chain.
 
 Certificate definitions use:
 
