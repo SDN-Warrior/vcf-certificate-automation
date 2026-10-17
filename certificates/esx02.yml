@@ -37,7 +37,7 @@ certificate:
     appliance: ESX
     target: esx02.vcf.sdn-warrior.cloud
     validate_certs: false
-    root_ca_file: /etc/ssl/certs/ISRG_Root_X1.pem
+    root_ca_file: /etc/ssl/certs/ISRG_Root_YR.pem
 
   renewal:
     renew_before_days: 30

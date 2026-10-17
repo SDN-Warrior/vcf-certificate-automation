@@ -120,7 +120,35 @@ echo "Playbook    : ${CERTIFICATE_PLAYBOOK}"
 echo "=================================================="
 echo
 
-exec ansible-playbook \
+if ansible-playbook \
   "${CERTIFICATE_PLAYBOOK}" \
   --vault-password-file /etc/vcf-certmanager/vault-pass \
   -e "certificate_name=${CERTIFICATE_NAME}"
+then
+  echo
+  echo "=================================================="
+  echo "Post-replacement settling period"
+  echo "=================================================="
+  echo "Certificate : ${CERTIFICATE_NAME}"
+  echo "Waiting     : 180 seconds"
+  echo "Reason      : allow VCF Operations background tasks to complete"
+  echo "=================================================="
+
+  sleep 180
+
+  echo
+  echo "Post-replacement settling period completed."
+else
+  PIPELINE_RC=$?
+
+  echo
+  echo "=================================================="
+  echo "Certificate pipeline failed"
+  echo "=================================================="
+  echo "Certificate : ${CERTIFICATE_NAME}"
+  echo "Exit code   : ${PIPELINE_RC}"
+  echo "No settling period will be started."
+  echo "=================================================="
+
+  exit "${PIPELINE_RC}"
+fi

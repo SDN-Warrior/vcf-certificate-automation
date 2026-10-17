@@ -240,6 +240,8 @@
           - openssl
           - verify
           - -CAfile
+          - "{{ certificate.deployment.root_ca_file }}"
+          - -untrusted
           - "{{ chain_path }}"
           - "{{ cert_path }}"
       register: chain_validation
